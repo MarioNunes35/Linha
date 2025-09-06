@@ -117,17 +117,42 @@ try:
     raw = robust_read_csv(file.getvalue())
     cols = list(raw.columns)
     
+    # Validate that we have meaningful data
+    if len(raw) == 0:
+        st.error("O arquivo está vazio ou não pôde ser lido corretamente.")
+        st.stop()
+    
+    # Check if we have at least numeric data
+    numeric_cols = []
+    for col in cols:
+        try:
+            # Try to convert to numeric to check if it's a valid data column
+            test_numeric = pd.to_numeric(raw[col], errors='coerce')
+            if test_numeric.notna().sum() > len(raw) * 0.5:  # At least 50% valid numbers
+                numeric_cols.append(col)
+        except:
+            pass
+    
+    if len(numeric_cols) == 0:
+        st.error("Nenhuma coluna numérica foi encontrada no arquivo. Verifique o formato dos dados.")
+        st.info("Formato esperado: arquivo CSV ou TXT com colunas separadas por vírgula, ponto-e-vírgula, tab ou espaço.")
+        st.stop()
+    
     # Show data preview
     st.sidebar.write("**Preview dos dados:**")
-    st.sidebar.dataframe(raw.head(3), height=120)
+    st.sidebar.dataframe(raw.head(5), height=150)
     
     # Show detected columns
     st.sidebar.write("**Colunas detectadas:**")
     for i, col in enumerate(cols):
-        st.sidebar.write(f"{i+1}. `{col}` ({len(raw[col])} valores)")
+        is_numeric = "✅ numérica" if col in numeric_cols else "❌ não-numérica"
+        nan_count = raw[col].isna().sum()
+        st.sidebar.write(f"{i+1}. `{col}` ({len(raw[col])} valores, {nan_count} NaN) {is_numeric}")
     
 except Exception as e:
     st.error(f"Erro ao ler o arquivo: {e}")
+    st.info("Dica: Certifique-se de que o arquivo está em formato CSV com colunas separadas.")
+    st.info("Se os dados X e Y estão em uma única coluna (ex: 'X;Y'), tente separá-los em duas colunas antes de fazer upload.")
     st.stop()
 
 st.sidebar.subheader("Mapeamento")
