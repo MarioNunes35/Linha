@@ -1,10 +1,10 @@
-# Streamlit – Baseline + Smoothing + Line Plot (Minimalist Tool)
+# Streamlit — Baseline + Smoothing + Line Plot (Minimalist Tool)
 # Author: ChatGPT (GPT-5 Thinking)
 # Purpose:
 #   A lightweight app that ONLY does: (1) baseline correction, (2) smoothing,
 #   and (3) line plotting for one X column and multiple Y columns.
 #   Supported baselines: None, AsLS (Eilers), Polynomial fit, Rolling-min.
-#   Supported smoothing: None, Savitzky–Golay, Moving Average.
+#   Supported smoothing: None, Savitzky—Golay, Moving Average.
 
 import io
 from typing import List, Dict
@@ -45,13 +45,23 @@ def robust_read_csv(file_bytes: bytes) -> pd.DataFrame:
 # Baselines
 def asls_baseline(y: np.ndarray, lam: float = 1e6, p: float = 0.01, niter: int = 10) -> np.ndarray:
     L = len(y)
-    D = sparse.diags([1, -2, 1], [0, -1, -2], shape=(L, L))
-    D = D[2:]
+    # Create second-order difference matrix
+    D = sparse.diags([1, -2, 1], [0, -1, -2], shape=(L-2, L-2), format='csr')
+    # Create the full difference matrix
+    D_full = sparse.lil_matrix((L-2, L))
+    for i in range(L-2):
+        D_full[i, i] = 1
+        D_full[i, i+1] = -2
+        D_full[i, i+2] = 1
+    D = D_full.tocsr()
+    
     w = np.ones(L)
+    z = y.copy()
+    
     for _ in range(niter):
-        W = sparse.spdiags(w, 0, L, L)
-        Z = W + lam * (D.T @ D)
-        z = spsolve(Z, w * y)
+        W = sparse.diags(w, 0, shape=(L, L), format='csr')
+        A = W + lam * (D.T @ D)
+        z = spsolve(A, w * y)
         w = p * (y > z) + (1 - p) * (y < z)
     return z
 
@@ -69,8 +79,9 @@ def smooth_savgol(y: np.ndarray, window: int = 21, poly: int = 3) -> np.ndarray:
     w = max(5, int(window))
     if w % 2 == 0:
         w += 1
+    p = min(int(poly), w - 1)  # Ensure polynomial order is less than window length
     try:
-        return savgol_filter(y, window_length=w, polyorder=int(poly))
+        return savgol_filter(y, window_length=w, polyorder=p)
     except Exception:
         return y
 
@@ -118,7 +129,7 @@ apply_baseline = st.sidebar.selectbox("Aplicar baseline em", ["Sinal original", 
 subtract_mode = st.sidebar.selectbox("Correção final", ["Subtrair baseline (y - base)", "Dividir (y/base)"], index=0)
 
 st.sidebar.header("Suavização")
-smooth_method = st.sidebar.selectbox("Método", ["Nenhuma", "Savitzky–Golay", "Média móvel"], index=1)
+smooth_method = st.sidebar.selectbox("Método", ["Nenhuma", "Savitzky—Golay", "Média móvel"], index=1)
 sg_w = st.sidebar.slider("SG: janela (pts)", 5, 201, 21, step=2)
 sg_p = st.sidebar.slider("SG: ordem", 2, 5, 3)
 ma_w = st.sidebar.slider("Média móvel: janela (pts)", 3, 201, 11, step=2)
@@ -135,6 +146,11 @@ processed = {}
 baselines = {}
 
 for name, y in Y.items():
+    # Skip if data contains NaN values
+    if np.any(np.isnan(y)):
+        st.warning(f"Coluna {name} contém valores NaN. Pulando processamento.")
+        continue
+    
     y0 = y.copy()
 
     # Choose smoothing first or baseline first
@@ -158,7 +174,7 @@ for name, y in Y.items():
             y_corr = y0 / denom
 
         # smoothing afterwards
-        if smooth_method == "Savitzky–Golay":
+        if smooth_method == "Savitzky—Golay":
             y_out = smooth_savgol(y_corr, window=int(sg_w), poly=int(sg_p))
         elif smooth_method == "Média móvel":
             y_out = smooth_moving_average(y_corr, window=int(ma_w))
@@ -166,7 +182,7 @@ for name, y in Y.items():
             y_out = y_corr
 
     else:  # baseline after smoothing
-        if smooth_method == "Savitzky–Golay":
+        if smooth_method == "Savitzky—Golay":
             y_sm = smooth_savgol(y0, window=int(sg_w), poly=int(sg_p))
         elif smooth_method == "Média móvel":
             y_sm = smooth_moving_average(y0, window=int(ma_w))
@@ -195,6 +211,9 @@ for name, y in Y.items():
 fig = go.Figure()
 
 for name in ys:
+    if name not in processed:  # Skip if processing failed
+        continue
+        
     if show_orig:
         fig.add_trace(go.Scatter(x=x, y=Y[name], mode='lines', name=f"{name} (orig)", line=dict(width=1), opacity=0.45))
     if show_base and baseline_method != "Nenhum":
@@ -215,19 +234,20 @@ st.plotly_chart(fig, use_container_width=True)
 # ------------------------------- Export ---------------------------------- #
 st.subheader("Exportar")
 # Processed CSV
-proc_df = pd.DataFrame({
-    (col_x if col_x != "<None>" else "index"): x,
-    **{f"{k}__processed": v for k, v in processed.items()},
-    **{f"{k}__baseline": v for k, v in baselines.items()},
-    **{f"{k}__original": Y[k] for k in ys},
-})
+if processed:  # Only create export if there's processed data
+    proc_df = pd.DataFrame({
+        (col_x if col_x != "<None>" else "index"): x,
+        **{f"{k}__processed": v for k, v in processed.items()},
+        **{f"{k}__baseline": v for k, v in baselines.items()},
+        **{f"{k}__original": Y[k] for k in ys if k in processed},
+    })
 
-buf = io.StringIO(); proc_df.to_csv(buf, index=False)
-st.download_button("⬇️ Baixar CSV (processado)", buf.getvalue(), file_name="baseline_smooth_processed.csv", mime="text/csv")
+    buf = io.StringIO(); proc_df.to_csv(buf, index=False)
+    st.download_button("⬇️ Baixar CSV (processado)", buf.getvalue(), file_name="baseline_smooth_processed.csv", mime="text/csv")
 
-# HTML figure
-html = pio.to_html(fig, include_plotlyjs='cdn', full_html=False)
-st.download_button("⬇️ Baixar HTML interativo", data=html, file_name="baseline_smooth_plot.html")
+    # HTML figure
+    html = pio.to_html(fig, include_plotlyjs='cdn', full_html=False)
+    st.download_button("⬇️ Baixar HTML interativo", data=html, file_name="baseline_smooth_plot.html")
 
 # ------------------------------- Notes ----------------------------------- #
 with st.expander("Notas & Boas Práticas"):
@@ -237,7 +257,7 @@ with st.expander("Notas & Boas Práticas"):
         - **AsLS (Eilers)**: ótimo para remover fundos curvos/assimétricos. Ajuste `λ` (mais alto = mais liso) e `p` (peso da assimetria).
         - **Polinomial**: bom para tendências globais (escolha o grau com parcimônia).
         - **Rolling Min**: aproxima o fundo pela envoltória inferior (útil p/ picos positivos).
-        - **Savitzky–Golay**: janela **ímpar**, preserve formas de pico.
+        - **Savitzky—Golay**: janela **ímpar**, preserve formas de pico.
         - **Exportação**: CSV inclui colunas `__original`, `__baseline` e `__processed` para auditoria.
         """
     )
