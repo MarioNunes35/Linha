@@ -205,16 +205,31 @@ for name, y in Y.items():
 # ------------------------------- Plotting -------------------------------- #
 fig = go.Figure()
 
+# Add some debug info
+if not processed:
+    st.error("Nenhum dado foi processado para plotagem!")
+    st.stop()
+
+plot_count = 0
 for name in ys:
     if name not in processed:  # Skip if processing failed
         continue
         
-    if show_orig:
+    if show_orig and name in Y:
         fig.add_trace(go.Scatter(x=x, y=Y[name], mode='lines', name=f"{name} (orig)", line=dict(width=1), opacity=0.45))
-    if show_base and baseline_method != "Nenhum":
+        plot_count += 1
+    if show_base and baseline_method != "Nenhum" and name in baselines:
         fig.add_trace(go.Scatter(x=x, y=baselines[name], mode='lines', name=f"{name} (base)", line=dict(width=2, dash='dot')))
-    if show_proc:
+        plot_count += 1
+    if show_proc and name in processed:
         fig.add_trace(go.Scatter(x=x, y=processed[name], mode='lines', name=f"{name} (proc)", line=dict(width=3)))
+        plot_count += 1
+
+if plot_count == 0:
+    st.error("Nenhuma série foi adicionada ao gráfico. Verifique as configurações de plotagem.")
+    st.stop()
+
+st.write(f"Plotando {plot_count} séries para {len(ys)} colunas selecionadas.")
 
 fig.update_layout(template='plotly_dark', height=620, legend_title='Séries')
 fig.update_xaxes(title_text=col_x if col_x != "<None>" else "Índice")
