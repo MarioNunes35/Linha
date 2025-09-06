@@ -372,3 +372,4 @@ else:
     st.info("Envie um arquivo CSV/TXT. O app detecta automaticamente vírgula/ponto e separador de milhar por coluna.")
 
 
+
