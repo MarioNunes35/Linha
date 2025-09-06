@@ -146,11 +146,6 @@ processed = {}
 baselines = {}
 
 for name, y in Y.items():
-    # Skip if data contains NaN values
-    if np.any(np.isnan(y)):
-        st.warning(f"Coluna {name} contém valores NaN. Pulando processamento.")
-        continue
-    
     y0 = y.copy()
 
     # Choose smoothing first or baseline first
