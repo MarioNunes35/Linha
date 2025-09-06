@@ -195,26 +195,66 @@ if not ys:
 
 # Pre-process
 df = raw.copy()
+
+# Clean X column values if selected
 if col_x == "<None>":
     x = np.arange(len(df))
     x_label = "Índice"
 else:
-    x = pd.to_numeric(df[col_x], errors='coerce').to_numpy()
+    # Try to clean and convert X column
+    x_series = df[col_x].astype(str).str.strip()
+    # Replace comma with dot for decimal numbers
+    x_series = x_series.str.replace(',', '.')
+    # Remove any non-numeric characters except dot and minus
+    x_series = x_series.str.replace(r'[^\d.-]', '', regex=True)
+    
+    x = pd.to_numeric(x_series, errors='coerce').to_numpy()
     x_label = col_x
-
-# Check for NaN values in X
-if col_x != "<None>" and np.isnan(x).any():
-    st.warning(f"⚠️ A coluna X '{col_x}' contém {np.isnan(x).sum()} valores não-numéricos que serão ignorados.")
-    valid_mask = ~np.isnan(x)
-    x = x[valid_mask]
-    df = df[valid_mask].reset_index(drop=True)
+    
+    # Check for NaN values and handle them
+    if np.isnan(x).all():
+        st.error(f"❌ A coluna X '{col_x}' não contém valores numéricos válidos.")
+        st.info("Usando índice como eixo X.")
+        x = np.arange(len(df))
+        x_label = "Índice"
+    elif np.isnan(x).any():
+        nan_count = np.isnan(x).sum()
+        st.warning(f"⚠️ A coluna X '{col_x}' contém {nan_count} valores não-numéricos.")
+        # Option to interpolate or use index
+        use_index = st.sidebar.checkbox(f"Usar índice em vez de '{col_x}'", value=False)
+        if use_index:
+            x = np.arange(len(df))
+            x_label = "Índice"
+        else:
+            # Remove NaN rows
+            valid_mask = ~np.isnan(x)
+            x = x[valid_mask]
+            df = df[valid_mask].reset_index(drop=True)
+            st.info(f"Removendo {nan_count} linhas com valores X inválidos.")
 
 Y = {}
 for c in ys:
-    y_values = pd.to_numeric(df[c], errors='coerce').to_numpy()
-    if np.isnan(y_values).any():
-        st.sidebar.warning(f"⚠️ Coluna '{c}' tem {np.isnan(y_values).sum()} valores NaN")
+    # Clean Y column values
+    y_series = df[c].astype(str).str.strip()
+    # Replace comma with dot for decimal numbers
+    y_series = y_series.str.replace(',', '.')
+    # Remove any non-numeric characters except dot and minus
+    y_series = y_series.str.replace(r'[^\d.-]', '', regex=True)
+    
+    y_values = pd.to_numeric(y_series, errors='coerce').to_numpy()
+    
+    if np.isnan(y_values).all():
+        st.sidebar.error(f"❌ Coluna '{c}' não contém dados numéricos válidos.")
+        continue
+    elif np.isnan(y_values).any():
+        nan_count = np.isnan(y_values).sum()
+        st.sidebar.warning(f"⚠️ Coluna '{c}' tem {nan_count} valores NaN ({nan_count/len(y_values)*100:.1f}%)")
+    
     Y[c] = y_values
+
+if not Y:
+    st.error("❌ Nenhuma coluna Y contém dados numéricos válidos para processar.")
+    st.stop()
 
 st.sidebar.header("Baseline")
 baseline_method = st.sidebar.selectbox("Método", ["Nenhum", "AsLS (Eilers)", "Polinomial", "Rolling Min"], index=1)
