@@ -97,7 +97,14 @@ if not file:
     st.stop()
 
 raw = robust_read_csv(file.getvalue())
+# Clean column names to remove any hidden characters
+raw.columns = raw.columns.str.strip()
 cols = list(raw.columns)
+
+# Show actual column names for debugging
+st.sidebar.write("**Colunas detectadas:**")
+for i, col in enumerate(cols):
+    st.sidebar.write(f"{i+1}. `{col}`")
 
 st.sidebar.subheader("Mapeamento")
 col_x = st.sidebar.selectbox("Coluna X (opcional)", ["<None>"] + cols, index=0)
