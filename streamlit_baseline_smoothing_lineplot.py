@@ -1,7 +1,8 @@
 # streamlit_baseline_smoothing_lineplot.py
-# CSV/TXT/DPT (ASCII) -> leitura inteligente, auto decimal/milhar por coluna,
+# CSV/TXT/DPT (ASCII) -> leitura inteligente, auto decimal/milhar por coluna (Y),
 # parser especial de X, suavização e baseline ALS (com modo Auto).
-# Inclui correção: eixos/colunas sempre convertidos para string (evita TypeError no join).
+# Inclui: rótulos sempre str (evita TypeError), baseline ligada por padrão,
+# opção para mostrar/ocultar baseline e resumo do pipeline aplicado.
 
 import csv
 import io
@@ -35,7 +36,7 @@ def _keep_first_dot(s: str) -> str:
 
 def _parse_with(series: pd.Series, decimal: str, thousands: str) -> pd.Series:
     s = series.astype(str).str.replace("\xa0", " ", regex=False).str.strip()
-    s = s.str.replace(r"[^0-9\-\+,\.eE ]", "", regex=True)  # mantêm dígitos, sinais, ., ,, e/E, espaço
+    s = s.str.replace(r"[^0-9\-\+,\.eE ]", "", regex=True)  # mantém dígitos, sinais, ., ,, e/E, espaço
     s = s.str.replace(r"\s+", "", regex=True)               # remove espaços (evita "1 234,56")
     if thousands:
         s = s.str.replace(thousands, "", regex=False)
@@ -74,7 +75,7 @@ def auto_numeric(series: pd.Series) -> Tuple[np.ndarray, Dict[str, object]]:
 
 
 # -------------------------
-# Parser especial p/ X – reconstrói números quebrados
+# Parser especial p/ X – reconstrói números “quebrados”
 # -------------------------
 def parse_x_smart(series: pd.Series, xmin: float = 300.0, xmax: float = 4500.0) -> np.ndarray:
     """
@@ -359,8 +360,10 @@ mov_window = st.sidebar.slider("Janela (média móvel)", 3, 201, 11, step=2)
 sg_window = st.sidebar.slider("Janela (Savitzky-Golay)", 3, 201, 21, step=2)
 sg_poly = st.sidebar.slider("Ordem do polinômio (Sav-Gol)", 1, 7, 3, step=1)
 
-baseline_on = st.sidebar.checkbox("Corrigir linha de base (ALS)", value=False)
+# >>> baseline ligada por padrão + opção de mostrar curva <<<
+baseline_on = st.sidebar.checkbox("Corrigir linha de base (ALS)", value=True)
 baseline_auto = st.sidebar.checkbox("Auto (λ, p)", value=True, help="Testa alguns (λ, p) e escolhe o melhor.")
+show_baseline = st.sidebar.checkbox("Mostrar curva da baseline", value=True)
 als_lambda_log = st.sidebar.slider("λ (log10)", 3, 8, 6, step=1)
 als_p = st.sidebar.slider("p (assimetria)", 0.001, 0.100, 0.010, step=0.001)
 
@@ -401,6 +404,14 @@ if uploaded:
         order_x = st.checkbox("Ordenar por X crescente", value=True)
 
     st.markdown("---")
+
+    # Resumo do pipeline selecionado
+    applied = []
+    if baseline_on:
+        applied.append(f"baseline ({'auto' if baseline_auto else f'λ≈1e{als_lambda_log:g}, p={als_p:.3f}'})")
+    if smooth_on:
+        applied.append(f"suavização ({smooth_kind})")
+    st.caption("Aplicado: " + (" + ".join(applied) if applied else "nenhum"))
 
     if st.button("Converter e Processar", type="primary"):
         if not y_cols:
@@ -466,24 +477,26 @@ if uploaded:
         # Plot (tema escuro)
         fig = go.Figure()
         for c in y_labels:
+            # Original
             fig.add_trace(go.Scatter(
                 x=Xv, y=results[c]["original"], mode="lines",
                 name=f"{c} (orig.)", line=dict(width=max(1, line_width - 1), dash="dot"),
                 connectgaps=False,
             ))
-            if baseline_on:
+            # Baseline (opcional)
+            if baseline_on and show_baseline:
                 fig.add_trace(go.Scatter(
                     x=Xv, y=results[c]["baseline"], mode="lines",
                     name=f"{c} (baseline)", line=dict(width=max(1, line_width - 1), dash="dash"),
                     connectgaps=False,
                 ))
+            # Processada (orig - baseline [+ suavização])
             fig.add_trace(go.Scatter(
                 x=Xv, y=results[c]["processed"], mode="lines",
                 name=f"{c} (proc.)", line=dict(width=line_width),
                 connectgaps=False,
             ))
 
-        # >>> Patch do TypeError: garantir strings nos títulos <<<
         fig.update_layout(
             title="Curvas — original, baseline e processada",
             xaxis_title=x_label,
@@ -523,6 +536,7 @@ if uploaded:
 
 else:
     st.info("Envie um CSV/TXT/DPT. Para .dpt binário, exporte como texto/ASCII no software do equipamento.")
+
 
 
 
