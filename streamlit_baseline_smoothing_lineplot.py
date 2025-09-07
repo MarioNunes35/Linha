@@ -1,6 +1,7 @@
 # streamlit_baseline_smoothing_lineplot.py
 # CSV/TXT/DPT (ASCII) -> leitura inteligente, auto decimal/milhar por coluna (Y),
 # parser especial de X, suavização e baseline ALS (com modo Auto).
+# Novidade: detecção/seleção da DIREÇÃO DOS PICOS (Auto / Para cima / Para baixo).
 # Inclui: rótulos sempre str (evita TypeError), baseline ligada por padrão,
 # opção para mostrar/ocultar baseline e resumo do pipeline aplicado.
 
@@ -175,6 +176,7 @@ def baseline_als(y: np.ndarray, lam: float = 1e6, p: float = 0.01, niter: int = 
     return z_full
 
 def auto_baseline(y: np.ndarray) -> Tuple[float, float, np.ndarray]:
+    """Busca simples para (λ, p); projetada para picos positivos. Para picos negativos inverta y antes."""
     lam_list = [1e4, 3e4, 1e5, 3e5, 1e6, 3e6, 1e7]
     p_list = [0.005, 0.01, 0.02, 0.05]
     best, best_score = (1e6, 0.01, None), -1e9
@@ -193,6 +195,23 @@ def auto_baseline(y: np.ndarray) -> Tuple[float, float, np.ndarray]:
             if score > best_score:
                 best, best_score = (lam, p, z), score
     return best
+
+
+# -------------------------
+# Direção dos picos: Auto / Para cima / Para baixo
+# -------------------------
+def detect_peak_direction(y: np.ndarray) -> Tuple[str, Dict[str, float]]:
+    """Usa quantis robustos. Se a amplitude negativa (med - q05) > positiva (q95 - med), considera 'down'."""
+    y = np.asarray(y, float)
+    y = y[np.isfinite(y)]
+    if y.size < 10:
+        return "up", {"pos_amp": np.nan, "neg_amp": np.nan}
+    med = np.nanmedian(y)
+    q95 = np.nanquantile(y, 0.95)
+    q05 = np.nanquantile(y, 0.05)
+    pos_amp = float(q95 - med)
+    neg_amp = float(med - q05)
+    return ("down" if neg_amp > pos_amp else "up"), {"pos_amp": pos_amp, "neg_amp": neg_amp}
 
 
 # -------------------------
@@ -354,13 +373,22 @@ with st.expander("Preferências de leitura", expanded=False):
 # Sidebar – processamento e estilo
 st.sidebar.header("Processamento")
 xmin, xmax = st.sidebar.slider("Faixa-alvo para X", 100.0, 20000.0, (300.0, 4500.0))
+
+# >>> Direção dos picos <<<
+peak_dir_mode = st.sidebar.selectbox(
+    "Direção dos picos",
+    ["Auto (recomendado)", "Para cima (picos positivos)", "Para baixo (picos negativos)"],
+    index=0,
+    help="Se os picos forem depressões, escolha 'Para baixo' ou deixe em Auto."
+)
+
 smooth_on = st.sidebar.checkbox("Aplicar suavização", value=False)
 smooth_kind = st.sidebar.selectbox("Tipo de suavização", ["Média móvel", "Savitzky-Golay"], index=1)
 mov_window = st.sidebar.slider("Janela (média móvel)", 3, 201, 11, step=2)
 sg_window = st.sidebar.slider("Janela (Savitzky-Golay)", 3, 201, 21, step=2)
 sg_poly = st.sidebar.slider("Ordem do polinômio (Sav-Gol)", 1, 7, 3, step=1)
 
-# >>> baseline ligada por padrão + opção de mostrar curva <<<
+# baseline ligada por padrão + opção de mostrar curva
 baseline_on = st.sidebar.checkbox("Corrigir linha de base (ALS)", value=True)
 baseline_auto = st.sidebar.checkbox("Auto (λ, p)", value=True, help="Testa alguns (λ, p) e escolhe o melhor.")
 show_baseline = st.sidebar.checkbox("Mostrar curva da baseline", value=True)
@@ -406,7 +434,7 @@ if uploaded:
     st.markdown("---")
 
     # Resumo do pipeline selecionado
-    applied = []
+    applied = [f"picos={peak_dir_mode.split(' ')[0].lower()}"]
     if baseline_on:
         applied.append(f"baseline ({'auto' if baseline_auto else f'λ≈1e{als_lambda_log:g}, p={als_p:.3f}'})")
     if smooth_on:
@@ -451,22 +479,41 @@ if uploaded:
         results: Dict[str, Dict[str, np.ndarray]] = {}
         Xv = data_num[x_label].to_numpy()
 
+        detections = []  # para mostrar no UI
+
         for c in y_labels:
-            yv = data_num[c].to_numpy()
-            y_orig = yv.copy()
+            y_orig = data_num[c].to_numpy()
+
+            # 1) Direção dos picos
+            if peak_dir_mode.startswith("Auto"):
+                direction, stats = detect_peak_direction(y_orig)
+            elif peak_dir_mode.startswith("Para baixo"):
+                direction, stats = "down", {"pos_amp": np.nan, "neg_amp": np.nan}
+            else:
+                direction, stats = "up", {"pos_amp": np.nan, "neg_amp": np.nan}
+            detections.append(f"{c}: {direction} (pos_amp≈{stats['pos_amp']:.3g}, neg_amp≈{stats['neg_amp']:.3g})")
+
+            # 2) Para picos 'down', inverta o sinal para estimar a baseline e depois traga de volta
+            y_for = -y_orig if direction == "down" else y_orig
 
             if baseline_on:
                 if baseline_auto:
-                    lam, p, z = auto_baseline(y_orig)
+                    lam, p, z_for = auto_baseline(y_for)
                 else:
                     lam = 10 ** als_lambda_log
                     p = als_p
-                    z = baseline_als(y_orig, lam=lam, p=p, niter=20)
+                    z_for = baseline_als(y_for, lam=lam, p=p, niter=20)
+                z = -z_for if direction == "down" else z_for
             else:
                 z = np.full_like(y_orig, np.nan)
 
-            y_detr = y_orig - z if baseline_on else y_orig.copy()
+            # 3) Subtração: para picos 'down', usa z - y (picos positivos)
+            if baseline_on:
+                y_detr = (y_orig - z) if direction == "up" else (z - y_orig)
+            else:
+                y_detr = y_orig.copy()
 
+            # 4) Suavização (opcional)
             if smooth_on:
                 y_sm = moving_average(y_detr, mov_window) if smooth_kind == "Média móvel" else safe_savgol(y_detr, sg_window, sg_poly)
             else:
@@ -474,23 +521,24 @@ if uploaded:
 
             results[c] = dict(original=y_orig, baseline=z, processed=y_sm)
 
+        # Mostrar detecção
+        with st.expander("Direção dos picos (detecção/seleção)", expanded=False):
+            st.write("\n".join(detections))
+
         # Plot (tema escuro)
         fig = go.Figure()
         for c in y_labels:
-            # Original
             fig.add_trace(go.Scatter(
                 x=Xv, y=results[c]["original"], mode="lines",
                 name=f"{c} (orig.)", line=dict(width=max(1, line_width - 1), dash="dot"),
                 connectgaps=False,
             ))
-            # Baseline (opcional)
             if baseline_on and show_baseline:
                 fig.add_trace(go.Scatter(
                     x=Xv, y=results[c]["baseline"], mode="lines",
                     name=f"{c} (baseline)", line=dict(width=max(1, line_width - 1), dash="dash"),
                     connectgaps=False,
                 ))
-            # Processada (orig - baseline [+ suavização])
             fig.add_trace(go.Scatter(
                 x=Xv, y=results[c]["processed"], mode="lines",
                 name=f"{c} (proc.)", line=dict(width=line_width),
@@ -536,6 +584,7 @@ if uploaded:
 
 else:
     st.info("Envie um CSV/TXT/DPT. Para .dpt binário, exporte como texto/ASCII no software do equipamento.")
+
 
 
 
