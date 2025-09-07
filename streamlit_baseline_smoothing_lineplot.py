@@ -1,6 +1,6 @@
 # streamlit_baseline_smoothing_lineplot_improved.py
 # FTIR/XY: Correção de linha base com seleção MANUAL e automática
-# Versão corrigida e melhorada
+# Versão corrigida com pontos de ancoragem para AsLS
 
 import io, re
 import numpy as np
@@ -199,27 +199,47 @@ def adaptive_peak_detection(x, y_norm, sensitivity='medium'):
 
 def suggest_baseline_points(x, y, orientation, n_points=10):
     """Sugere pontos automáticos para a linha base"""
-    if orientation == "Picos para baixo":
-        # Procura máximos locais (topos entre os vales)
-        candidates = find_local_maxima(x, y, window_size=max(5, len(y)//20))
-    else:
-        # Procura mínimos locais (vales entre os picos)
-        candidates = find_local_minima(x, y, window_size=max(5, len(y)//20))
+    # CORREÇÃO: Invertida a lógica para picos para cima
+    if orientation == "Picos para cima":
+        # Para picos para cima, procura MÍNIMOS locais (vales entre os picos)
+        candidates = find_local_minima(x, y, window_size=max(10, len(y)//30))
+    else:  # Picos para baixo
+        # Para picos para baixo, procura MÁXIMOS locais (topos entre os vales)
+        candidates = find_local_maxima(x, y, window_size=max(10, len(y)//30))
     
     # Adiciona pontos nas extremidades
     edge_points = [0, len(y)-1]
     
+    # Adiciona alguns pontos intermediários em regiões sem candidatos
+    if len(candidates) < n_points - 2:
+        # Divide o espectro em segmentos e procura o ponto base em cada um
+        segment_size = len(y) // (n_points - 1)
+        for i in range(1, n_points - 1):
+            start = i * segment_size
+            end = min((i + 1) * segment_size, len(y))
+            segment = y[start:end]
+            if len(segment) > 0:
+                if orientation == "Picos para cima":
+                    local_min = start + np.argmin(segment)
+                    candidates = np.append(candidates, local_min)
+                else:
+                    local_max = start + np.argmax(segment)
+                    candidates = np.append(candidates, local_max)
+    
+    candidates = np.unique(candidates)
+    
     if len(candidates) > 0:
         # Seleciona pontos distribuídos
         if len(candidates) > n_points - 2:
+            # Usa clustering simples para selecionar pontos bem distribuídos
             step = len(candidates) // (n_points - 2)
-            selected = candidates[::step][:n_points-2]
+            selected = candidates[::max(1, step)][:n_points-2]
         else:
             selected = candidates
         
         all_points = sorted(list(edge_points) + list(selected))
     else:
-        # Distribui pontos uniformemente
+        # Distribui pontos uniformemente como fallback
         all_points = np.linspace(0, len(y)-1, n_points, dtype=int).tolist()
     
     return all_points
@@ -337,7 +357,9 @@ if baseline_method in ["Manual", "Híbrido"]:
     
     # Controle de suavidade para spline
     if interp_method == 'spline_smooth':
-        smoothness = st.slider("Suavidade da spline (maior = mais reta)", 0.001, 0.1, 0.01, 0.001)
+        smoothness = st.slider("Suavidade da spline (maior = mais reta)", 0.001, 0.5, 0.05, 0.001)
+    else:
+        smoothness = 0.01
     
     col_m1, col_m2, col_m3 = st.columns([2, 2, 1])
     
@@ -360,10 +382,23 @@ if baseline_method in ["Manual", "Híbrido"]:
                     st.error("❌ Formato inválido")
     
     with col_m2:
-        # Sugestão automática de pontos
-        n_suggest = st.number_input("Número de pontos a sugerir:", 5, 30, 10)
+        # Sugestão automática de pontos com controle adicional
+        col_suggest1, col_suggest2 = st.columns(2)
+        with col_suggest1:
+            n_suggest = st.number_input("Nº de pontos:", 5, 30, 12, 1)
+        with col_suggest2:
+            suggest_method = st.selectbox("Método:", ["Auto", "Vales", "Topos"])
+        
         if st.button("🎯 Sugerir pontos automáticos"):
-            suggested = suggest_baseline_points(x, y_proc, orientation_eff, n_suggest)
+            # Override da orientação se o usuário escolher manualmente
+            if suggest_method == "Vales":
+                temp_orientation = "Picos para cima"
+            elif suggest_method == "Topos":
+                temp_orientation = "Picos para baixo"
+            else:
+                temp_orientation = orientation_eff
+            
+            suggested = suggest_baseline_points(x, y_proc, temp_orientation, n_suggest)
             st.session_state.manual_points = suggested
             st.success(f"✅ {len(suggested)} pontos sugeridos")
             st.rerun()
@@ -395,17 +430,31 @@ if baseline_method in ["Manual", "Híbrido"]:
                 if st.button("Atualizar pontos"):
                     st.session_state.manual_points = edited_df['Índice'].tolist()
                     st.rerun()
+else:
+    smoothness = 0.01  # Valor padrão quando não está no modo Manual/Híbrido
 
-# Parâmetros adicionais para modo automático
+# Parâmetros adicionais para modo automático - SEMPRE definir antes de usar
+use_anchor_points = False  
+n_anchors = 10
+anchor_method = "Distribuído"
+lam = 6
+p_asls = 0.001
+niter = 10
+
 if baseline_method == "Automático (AsLS)":
     with st.expander("⚙️ Parâmetros AsLS"):
-        lam = st.slider("λ (suavidade, log10)", 2, 8, 6, 1)
-        p_asls = st.slider("p (assimetria)", 0.000, 0.500, 0.001, 0.001)
-        niter = st.slider("Iterações", 1, 30, 10, 1)
-else:
-    lam = 6
-    p_asls = 0.001
-    niter = 10
+        col_asls1, col_asls2 = st.columns(2)
+        with col_asls1:
+            lam = st.slider("λ (suavidade, log10)", 2, 8, 6, 1)
+            p_asls = st.slider("p (assimetria)", 0.000, 0.500, 0.001, 0.001)
+        with col_asls2:
+            niter = st.slider("Iterações", 1, 30, 10, 1)
+            use_anchor_points = st.checkbox("Usar pontos de ancoragem", True)
+        
+        if use_anchor_points:
+            n_anchors = st.slider("Número de pontos âncora", 5, 20, 10, 1)
+            anchor_method = st.selectbox("Método de ancoragem", 
+                                        ["Distribuído", "Vales", "Topos", "Adaptativo"])
 
 # Cálculo da linha base
 baseline = None
@@ -426,8 +475,6 @@ elif baseline_method == "Automático (AsLS)":
     
     if use_anchor_points:
         # Adiciona pontos de ancoragem para melhor controle
-        st.session_state.manual_points = []  # Limpa pontos anteriores
-        
         if anchor_method == "Distribuído":
             # Distribui pontos uniformemente
             anchor_indices = np.linspace(0, len(y)-1, n_anchors, dtype=int).tolist()
@@ -570,87 +617,7 @@ fig.update_layout(
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
 )
 
-st.plotly_chart(fig, use_container_width=True, config={'displaylogo': False})
-
-# Gráfico corrigido
-if show_corrected and y_corr is not None:
-    fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(
-        x=x, y=y_corr,
-        mode='lines',
-        name='Sinal corrigido',
-        line=dict(width=2, color='#95E77E')
-    ))
-    
-    # Linha zero de referência
-    fig2.add_hline(y=0, line_dash="dot", line_color="gray", opacity=0.5)
-    
-    fig2.update_layout(
-        template="plotly_dark",
-        title="Espectro Corrigido",
-        xaxis_title="X",
-        yaxis_title="Intensidade corrigida",
-        height=400,
-        hovermode='x unified'
-    )
-    
-    st.plotly_chart(fig2, use_container_width=True, config={'displaylogo': False})
-
-# Estatísticas
-if y_corr is not None:
-    st.markdown("---")
-    st.markdown("### 📊 Estatísticas")
-    
-    col_s1, col_s2, col_s3, col_s4 = st.columns(4)
-    with col_s1:
-        st.metric("Orientação", orientation_eff)
-    with col_s2:
-        n_points = len(st.session_state.manual_points) if baseline_method in ["Manual", "Híbrido"] else "Auto"
-        st.metric("Pontos base", n_points)
-    with col_s3:
-        st.metric("RMS original", f"{np.sqrt(np.mean(y_proc**2)):.4f}")
-    with col_s4:
-        st.metric("RMS corrigido", f"{np.sqrt(np.mean(y_corr**2)):.4f}")
-
-# Exportação
-if y_corr is not None:
-    st.markdown("---")
-    st.markdown("### 💾 Exportar Resultados")
-    
-    col_e1, col_e2 = st.columns(2)
-    
-    with col_e1:
-        # Preparar dados para exportação
-        export_df = pd.DataFrame({
-            'X': x,
-            'Y_original': y,
-            'Y_processado': y_proc,
-            'Y_baseline': baseline if baseline is not None else np.zeros_like(y),
-            'Y_corrigido': y_corr
-        })
-        
-        csv = export_df.to_csv(index=False)
-        st.download_button(
-            label="📥 Baixar CSV completo",
-            data=csv.encode('utf-8'),
-            file_name=f"{up.name.rsplit('.', 1)[0]}_corrigido.csv",
-            mime='text/csv'
-        )
-    
-    with col_e2:
-        # Exportar apenas X e Y corrigido
-        simple_df = pd.DataFrame({'X': x, 'Y': y_corr})
-        csv_simple = simple_df.to_csv(index=False)
-        st.download_button(
-            label="📥 Baixar apenas X,Y corrigido",
-            data=csv_simple.encode('utf-8'),
-            file_name=f"{up.name.rsplit('.', 1)[0]}_XY_corrigido.csv",
-            mime='text/csv'
-        )
-
-# Rodapé com informações
-st.markdown("---")
-st.caption("💡 **Dica:** Use o modo Manual para controle total sobre a linha base, ou Híbrido para combinar seleção manual com refinamento automático.")
+st.plotly_chart(fig, use_container
 
 
 
