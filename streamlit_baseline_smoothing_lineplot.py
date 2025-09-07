@@ -424,12 +424,37 @@ if baseline_method == "Manual":
 elif baseline_method == "Automático (AsLS)":
     lam_val = 10.0**lam
     
+    if use_anchor_points:
+        # Adiciona pontos de ancoragem para melhor controle
+        st.session_state.manual_points = []  # Limpa pontos anteriores
+        
+        if anchor_method == "Distribuído":
+            # Distribui pontos uniformemente
+            anchor_indices = np.linspace(0, len(y)-1, n_anchors, dtype=int).tolist()
+        elif anchor_method == "Vales":
+            anchor_indices = suggest_baseline_points(x, y_proc, "Picos para cima", n_anchors)
+        elif anchor_method == "Topos":
+            anchor_indices = suggest_baseline_points(x, y_proc, "Picos para baixo", n_anchors)
+        else:  # Adaptativo
+            anchor_indices = suggest_baseline_points(x, y_proc, orientation_eff, n_anchors)
+        
+        st.session_state.manual_points = anchor_indices
+    
+    # Calcula baseline AsLS
     if orientation_eff == "Picos para baixo":
         baseline = -asls_baseline(-y_proc, lam=lam_val, p=p_asls, niter=niter)
-        y_corr = y_proc - baseline
     else:
         baseline = asls_baseline(y_proc, lam=lam_val, p=p_asls, niter=niter)
-        y_corr = y_proc - baseline
+    
+    # Se houver pontos âncora, faz uma correção adicional
+    if use_anchor_points and st.session_state.manual_points:
+        # Cria uma baseline híbrida que passa pelos pontos âncora
+        anchor_baseline = create_manual_baseline(x, y_proc, st.session_state.manual_points, 'spline_smooth', 0.1)
+        # Combina as duas baselines com peso
+        weight = 0.3  # Peso para a baseline de âncoras
+        baseline = (1 - weight) * baseline + weight * anchor_baseline
+    
+    y_corr = y_proc - baseline
 
 elif baseline_method == "Detecção de picos":
     # Normaliza para detecção
