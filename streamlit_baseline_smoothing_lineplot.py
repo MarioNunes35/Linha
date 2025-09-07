@@ -1,18 +1,18 @@
 # streamlit_baseline_smoothing_lineplot.py
-# Linha-base + suavização + detecção por derivada + retas entre bases
-# Aceita .txt/.csv/.dpt com 2 colunas X,Y (vírgula ou ponto decimal)
+# Baseline por retas entre as bases dos vales (FTIR). Aceita .txt/.csv/.dpt (2 colunas).
+# Ordena X em crescente; detecção robusta com derivadas + find_peaks.
 
 import io, re
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
-from scipy.signal import savgol_filter, peak_prominences
+from scipy.signal import savgol_filter, find_peaks, peak_prominences
 
-st.set_page_config(page_title="Baseline & Peaks (derivative)", layout="wide")
+st.set_page_config(page_title="Baseline (retas entre bases) • FTIR/XY", layout="wide")
 NUM_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
 
-# ---------------- utils ----------------
+# ------------------ IO ------------------
 def _safe_float(s: str) -> float:
     return float(s.replace(",", "."))
 
@@ -36,11 +36,14 @@ def _parse_xy_text(text: str) -> pd.DataFrame:
 
 def load_xy(uploaded) -> pd.DataFrame:
     raw = uploaded.read()
+    text = None
     for enc in ("utf-8", "latin-1"):
         try:
             text = raw.decode(enc, errors="ignore"); break
-        except Exception: pass
-    # tenta csv rápido
+        except Exception: 
+            pass
+    if text is None:
+        text = raw.decode("utf-8", errors="ignore")
     try:
         df = pd.read_csv(io.StringIO(text), sep=None, engine="python",
                          comment="#", header=None, names=["X","Y"])
@@ -52,184 +55,168 @@ def load_xy(uploaded) -> pd.DataFrame:
     except Exception:
         return _parse_xy_text(text)
 
+# ------------------ Baseline logic ------------------
 def infer_orientation(y: np.ndarray) -> str:
     med = np.median(y)
     return "Picos para cima" if (np.max(y)-med) >= (med-np.min(y)) else "Picos para baixo"
 
-def piecewise_segments(x, y, peaks_idx, y_norm, orientation):
-    # bases via proeminência (no sinal invertido quando picos são para baixo)
-    if orientation == "Picos para baixo":
-        inv = 1.0 - y_norm
-        prom, lb, rb = peak_prominences(inv, peaks_idx)
+def detect_valleys(x, y, *,
+                   use_deriv=True, w=21, p=3,
+                   dist_min=150, prom_min=0.02, width_min=10):
+    """Retorna (peaks_idx, left_bases, right_bases, y_norm) onde os 'peaks' são os VALes."""
+    yr = np.ptp(y) if np.ptp(y)>0 else 1.0
+    y_norm = (y - np.min(y)) / yr
+    inv = 1.0 - y_norm  # vales -> picos
+
+    if use_deriv:
+        dx = float(np.mean(np.diff(x))) if len(x)>1 else 1.0
+        dy = savgol_filter(y_norm, window_length=max(w, 5), polyorder=min(p, 5),
+                           deriv=1, delta=dx, mode="interp")
+        d2y = savgol_filter(y_norm, window_length=max(w, 5), polyorder=min(p, 5),
+                            deriv=2, delta=dx, mode="interp")
+        zc = np.where((dy[:-1] < 0) & (dy[1:] >= 0))[0]      # - -> +  (vale)
+        half = max(2, w//2)
+        peaks_idx = []
+        for i in zc:
+            if d2y[i] <= 0:  # requer curvatura positiva
+                continue
+            a = max(0, i-half); b = min(len(y_norm)-1, i+1+half)
+            j = a + int(np.argmin(y_norm[a:b+1]))
+            peaks_idx.append(j)
+        peaks_idx = np.array(sorted(set(peaks_idx)), dtype=int)
+        if len(peaks_idx) == 0:
+            peaks_idx, _ = find_peaks(inv, distance=dist_min, width=width_min, prominence=prom_min)
     else:
-        prom, lb, rb = peak_prominences(y_norm, peaks_idx)
+        peaks_idx, _ = find_peaks(inv, distance=dist_min, width=width_min, prominence=prom_min)
+
+    prom_vals, lb, rb = peak_prominences(inv, peaks_idx)
+    m = prom_vals >= prom_min
+    return peaks_idx[m], lb[m], rb[m], y_norm
+
+def make_segments(x, y_display, left_bases, right_bases):
     segs = []
-    for L,R in zip(lb, rb):
-        L = int(L); R = int(R)
+    for L, R in zip(left_bases, right_bases):
+        L=int(L); R=int(R)
         if R <= L: 
             continue
-        segs.append((float(x[L]), float(y[L]), float(x[R]), float(y[R]), L, R))
+        segs.append((float(x[L]), float(y_display[L]), float(x[R]), float(y_display[R]), L, R))
     return segs
 
-def apply_baseline_in_windows(x, y, segments, orientation):
+def subtract_in_windows(x, y, segments, orientation):
     yc = y.copy()
     for (x0,y0,x1,y1,L,R) in segments:
-        m = (y1-y0)/(x1-x0) if x1 != x0 else 0.0
+        m = (y1-y0)/(x1-x0) if x1!=x0 else 0.0
         xr = x[L:R+1]
         yline = y0 + m*(xr-x0)
-        if orientation == "Picos para cima":
-            yc[L:R+1] = y[L:R+1] - yline
-        else:
+        if orientation == "Picos para baixo":
             yc[L:R+1] = yline - y[L:R+1]
+        else:
+            yc[L:R+1] = y[L:R+1] - yline
     return yc
 
-# ---------------- UI ----------------
-st.title("Ajuste de linha-base com detecção por derivada")
+def build_global_baseline(x, y, segments):
+    base = np.zeros_like(y, dtype=float)
+    for (x0,y0,x1,y1,L,R) in segments:
+        m = (y1-y0)/(x1-x0) if x1!=x0 else 0.0
+        xr = x[L:R+1]
+        base[L:R+1] = y0 + m*(xr-x0)
+    return base
 
-up = st.file_uploader("Carregue .txt/.csv/.dpt com 2 colunas X,Y", type=["txt","csv","dpt"])
+# ------------------ UI ------------------
+st.title("Subtração de linha-base por retas entre as bases dos picos (vales)")
+
+up = st.file_uploader("Carregue .txt/.csv/.dpt (2 colunas X,Y)", type=["txt","csv","dpt"])
 c1, c2, c3 = st.columns(3)
 
 with c1:
-    smooth_on = st.checkbox("Suavizar (Savitzky-Golay)", True)
-    win = st.slider("Janela (ímpar)", 5, 201, 31, step=2)
-    poly = st.slider("Ordem do polinômio", 1, 5, 3)
+    smooth_on = st.checkbox("Suavizar antes (Savitzky-Golay)", True)
+    w = st.slider("Janela SG (ímpar)", 5, 201, 21, step=2)
+    p = st.slider("Ordem SG", 1, 5, 3)
 
 with c2:
-    orientation = st.selectbox("Orientação dos picos", ["Detectar automaticamente","Picos para cima","Picos para baixo"])
-    prom_min = st.slider("Proeminência mínima (rel.)", 0.0, 0.5, 0.02, 0.005,
-                         help="Aplicada após localizar os picos (0–0.5 do range normalizado).")
-    dist_min = st.slider("Distância mínima entre picos (pontos)", 1, 1000, 50, 1)
+    orientation = st.selectbox("Orientação dos picos", ["Picos para baixo", "Picos para cima", "Detectar automaticamente"], index=0)
+    use_deriv = st.checkbox("Localizar picos por derivadas", True)
 
 with c3:
-    use_deriv = st.checkbox("Detectar por derivada (1ª + 2ª)", True)
-    curv_rel = st.slider("Curvatura mínima (|2ª deriv|, rel.)", 0.0, 0.5, 0.05, 0.01,
-                         help="Filtra picos com curvatura fraca; relativo ao max |d²y/dx²|.")
-    k_win = st.slider("Janela local para refinamento (±k)", 1, 50, 6, 1)
-    show_corr = st.checkbox("Mostrar gráfico corrigido", True)
+    prom_min = st.slider("Proeminência mínima (rel.)", 0.0, 0.5, 0.02, 0.005)
+    dist_min = st.slider("Distância mínima (pontos)", 1, 1000, 150, 1)
+    width_min = st.slider("Largura mínima (pontos)", 1, 400, 10, 1)
 
-show_lines = st.checkbox("Mostrar retas brancas", True)
+show_lines = st.checkbox("Mostrar retas/bases", True)
+show_bases = st.checkbox("Marcar bases e mínimos", False)
+mode_correction = st.radio("Modo de correção", ["Somente janelas dos picos", "Baseline global por partes"], index=0)
+show_corrected = st.checkbox("Mostrar gráfico corrigido", True)
+enable_export = st.checkbox("Exportar dados corrigidos", False)
 
-if not up:
-    st.info("Carregue um arquivo para começar.")
-    st.stop()
+if up:
+    df = load_xy(up)
+    x = df["X"].to_numpy(dtype=float)
+    y = df["Y"].to_numpy(dtype=float)
 
-df = load_xy(up)
-x = df["X"].to_numpy(dtype=float)
-y = df["Y"].to_numpy(dtype=float)
+    y_proc = y.copy()
+    if smooth_on and len(y_proc) >= w:
+        y_proc = savgol_filter(y_proc, window_length=w, polyorder=p, mode="interp")
 
-# suavização base (opcional) para estabilidade das derivadas
-y_proc = y.copy()
-if smooth_on and len(y_proc) >= win:
-    y_proc = savgol_filter(y_proc, window_length=win, polyorder=poly, mode="interp")
+    orientation_eff = infer_orientation(y_proc) if orientation == "Detectar automaticamente" else orientation
 
-# orientação
-orientation_eff = infer_orientation(y_proc) if orientation == "Detectar automaticamente" else orientation
+    peaks_idx, lb, rb, y_norm = detect_valleys(
+        x, y_proc, use_deriv=use_deriv, w=w, p=p,
+        dist_min=dist_min, prom_min=prom_min, width_min=width_min
+    )
 
-# normalização para métricas relativas
-yr = np.ptp(y_proc) if np.ptp(y_proc) > 0 else 1.0
-y_norm = (y_proc - np.min(y_proc)) / yr
+    segments = make_segments(x, y_proc, lb, rb)
 
-# ------------- detecção de picos -------------
-if use_deriv:
-    # 1ª e 2ª derivadas por Savitzky-Golay
-    dx_mean = float(np.mean(np.diff(x))) if len(x) > 1 else 1.0
-    dy = savgol_filter(y_proc, window_length=max(win,5), polyorder=min(poly,5),
-                       deriv=1, delta=dx_mean, mode="interp")
-    d2y = savgol_filter(y_proc, window_length=max(win,5), polyorder=min(poly,5),
-                        deriv=2, delta=dx_mean, mode="interp")
-
-    # zero-crossings da 1ª derivada + curvatura mínima
-    if orientation_eff == "Picos para cima":
-        zc = np.where((dy[:-1] > 0) & (dy[1:] <= 0))[0]  # + -> -
-        curv_th = curv_rel * np.max(np.abs(d2y)) if np.max(np.abs(d2y))>0 else 0.0
-        cand = [i for i in zc if d2y[i] < -curv_th]
-        # refinar para o máximo real em ±k
-        peaks_idx = []
-        for i in cand:
-            a = max(0, i-k_win); b = min(len(y_proc)-1, i+1+k_win)
-            j = a + int(np.argmax(y_proc[a:b+1]))
-            peaks_idx.append(j)
-    else:  # picos para baixo
-        zc = np.where((dy[:-1] < 0) & (dy[1:] >= 0))[0]  # - -> +
-        curv_th = curv_rel * np.max(np.abs(d2y)) if np.max(np.abs(d2y))>0 else 0.0
-        cand = [i for i in zc if d2y[i] > curv_th]
-        peaks_idx = []
-        for i in cand:
-            a = max(0, i-k_win); b = min(len(y_proc)-1, i+1+k_win)
-            j = a + int(np.argmin(y_proc[a:b+1]))
-            peaks_idx.append(j)
-
-    # remover picos muito próximos (distância mínima)
-    peaks_idx = np.array(sorted(set(peaks_idx)), dtype=int)
-    if len(peaks_idx) > 1 and dist_min > 1:
-        keep = [peaks_idx[0]]
-        for j in peaks_idx[1:]:
-            if j - keep[-1] >= dist_min:
-                keep.append(j)
-            else:
-                # mantém o mais proeminente dentro do bloco
-                seg = slice(keep[-1], j+1)
-                local = keep[-1] if orientation_eff=="Picos para cima" else keep[-1]
-                keep[-1] = j  # simples: fica o último (mais à direita)
-        peaks_idx = np.array(keep, dtype=int)
-
-    # filtrar por proeminência (relativa)
-    if orientation_eff == "Picos para baixo":
-        prom_vals, lb, rb = peak_prominences(1.0 - y_norm, peaks_idx)
+    if mode_correction == "Somente janelas dos picos":
+        y_corr = subtract_in_windows(x, y_proc, segments, orientation_eff)
+        baseline_plot = None
     else:
-        prom_vals, lb, rb = peak_prominences(y_norm, peaks_idx)
-    mask_prom = prom_vals >= prom_min
-    peaks_idx, lb, rb = peaks_idx[mask_prom], lb[mask_prom], rb[mask_prom]
+        baseline_plot = build_global_baseline(x, y_proc, segments)
+        if orientation_eff == "Picos para baixo":
+            y_corr = baseline_plot - y_proc
+        else:
+            y_corr = y_proc - baseline_plot
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=x, y=y_proc, mode="lines", name="Sinal (processado)",
+                             line=dict(width=3, color="#E4572E")))
+    if show_lines:
+        for (x0,y0,x1,y1,_,_) in segments:
+            fig.add_shape(type="line", x0=x0, y0=y0, x1=x1, y1=y1,
+                          line=dict(color="white", width=6))
+    if show_bases and len(segments)>0:
+        xs_lb = x[lb.astype(int)]; ys_lb = y_proc[lb.astype(int)]
+        xs_rb = x[rb.astype(int)]; ys_rb = y_proc[rb.astype(int)]
+        xs_pk = x[peaks_idx];      ys_pk = y_proc[peaks_idx]
+        fig.add_trace(go.Scatter(x=xs_lb, y=ys_lb, mode="markers", name="base esq.", marker=dict(symbol="triangle-left", size=10, color="white")))
+        fig.add_trace(go.Scatter(x=xs_rb, y=ys_rb, mode="markers", name="base dir.", marker=dict(symbol="triangle-right", size=10, color="white")))
+        fig.add_trace(go.Scatter(x=xs_pk, y=ys_pk, mode="markers", name="mínimo", marker=dict(symbol="x", size=10, color="cyan")))
+
+    fig.update_layout(template="plotly_dark", margin=dict(l=30,r=20,t=40,b=40),
+                      xaxis_title="X", yaxis_title="Y", height=520)
+
+    tabs = st.tabs(["Original (com retas)", "Corrigido" if show_corrected else ""])
+    with tabs[0]:
+        st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
+
+    if show_corrected:
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=x, y=y_corr, mode="lines", name="Y corrigido",
+                                  line=dict(width=3)))
+        if baseline_plot is not None:
+            fig2.add_trace(go.Scatter(x=x, y=baseline_plot, mode="lines", name="Baseline (por partes)", line=dict(width=2, dash="dash")))
+        fig2.update_layout(template="plotly_dark", margin=dict(l=30,r=20,t=40,b=40),
+                           xaxis_title="X", yaxis_title="Y corrigido", height=520)
+        st.plotly_chart(fig2, use_container_width=True, config={"displaylogo": False})
+
+    st.caption(f"Orientação: **{orientation_eff}** | picos detectados: **{len(segments)}** | derivadas: **{'on' if use_deriv else 'off'}**")
+
+    if enable_export:
+        out = pd.DataFrame({"X": x, "Y_original": y, "Y_processado": y_proc, "Y_corrigido": y_corr})
+        st.download_button("Baixar .csv", out.to_csv(index=False).encode("utf-8"),
+                           file_name=f"{up.name.rsplit('.',1)[0]}_corrigido.csv", mime="text/csv")
 else:
-    # fallback (apenas proeminência em y_norm)
-    if orientation_eff == "Picos para baixo":
-        inv = 1.0 - y_norm
-        # usar threshold via proeminência -> capturamos todos e filtramos
-        # (find_peaks já foi substituído por derivadas quando use_deriv=True)
-        from scipy.signal import find_peaks
-        pks, _ = find_peaks(inv, distance=dist_min, prominence=prom_min)
-        prom_vals, lb, rb = peak_prominences(inv, pks)
-        peaks_idx = pks
-    else:
-        from scipy.signal import find_peaks
-        pks, _ = find_peaks(y_norm, distance=dist_min, prominence=prom_min)
-        prom_vals, lb, rb = peak_prominences(y_norm, pks)
-        peaks_idx = pks
+    st.info("Carregue um arquivo para começar. Dica: para FTIR, deixe 'Picos para baixo' selecionado.")
 
-# segmentos (retas entre as bases)
-segments = []
-for L,R in zip(lb, rb):
-    L=int(L); R=int(R)
-    if R>L:
-        segments.append((x[L], y_proc[L], x[R], y_proc[R], L, R))
-
-# correção
-y_corr = apply_baseline_in_windows(x, y_proc, segments, orientation_eff)
-
-# ---------------- plots ----------------
-fig = go.Figure()
-fig.add_trace(go.Scatter(x=x, y=y_proc, mode="lines", name="Sinal (processado)",
-                         line=dict(width=3, color="#E4572E")))
-if show_lines:
-    for (x0,y0,x1,y1,_,_) in segments:
-        fig.add_shape(type="line", x0=float(x0), y0=float(y0), x1=float(x1), y1=float(y1),
-                      line=dict(color="white", width=6))
-fig.update_layout(template="plotly_dark", margin=dict(l=30,r=20,t=40,b=40),
-                  xaxis_title="X", yaxis_title="Y", height=520)
-
-st.subheader("Original (com retas)")
-st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
-
-if show_corr:
-    fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(x=x, y=y_corr, mode="lines", name="Y corrigido",
-                              line=dict(width=3)))
-    fig2.update_layout(template="plotly_dark", margin=dict(l=30,r=20,t=40,b=40),
-                       xaxis_title="X", yaxis_title="Y corrigido", height=520)
-    st.subheader("Corrigido")
-    st.plotly_chart(fig2, use_container_width=True, config={"displaylogo": False})
-
-st.caption(f"Orientação: **{orientation_eff}** | Picos: **{len(segments)}** | Derivadas: **{'on' if use_deriv else 'off'}**")
 
 
 
