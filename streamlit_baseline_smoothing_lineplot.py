@@ -76,21 +76,33 @@ def infer_orientation(y: np.ndarray) -> str:
     return "Picos para cima" if (np.max(y)-med) >= (med-np.min(y)) else "Picos para baixo"
 
 def find_local_minima(x, y, window_size=50):
-    """Encontra mínimos locais"""
+    """Encontra mínimos locais com melhor robustez"""
     minima = []
+    # Ajusta window_size se for muito grande
+    window_size = min(window_size, len(y)//4)
+    window_size = max(5, window_size)  # Mínimo de 5 pontos
+    
     for i in range(window_size, len(y) - window_size):
-        window = y[i-window_size:i+window_size+1]
-        if y[i] == np.min(window):
-            minima.append(i)
+        window = y[max(0, i-window_size):min(len(y), i+window_size+1)]
+        if len(window) > 0 and y[i] == np.min(window):
+            # Verifica se não está muito próximo do último mínimo adicionado
+            if not minima or i - minima[-1] > window_size//2:
+                minima.append(i)
     return np.array(minima)
 
 def find_local_maxima(x, y, window_size=50):
-    """Encontra máximos locais"""
+    """Encontra máximos locais com melhor robustez"""
     maxima = []
+    # Ajusta window_size se for muito grande
+    window_size = min(window_size, len(y)//4)
+    window_size = max(5, window_size)  # Mínimo de 5 pontos
+    
     for i in range(window_size, len(y) - window_size):
-        window = y[i-window_size:i+window_size+1]
-        if y[i] == np.max(window):
-            maxima.append(i)
+        window = y[max(0, i-window_size):min(len(y), i+window_size+1)]
+        if len(window) > 0 and y[i] == np.max(window):
+            # Verifica se não está muito próximo do último máximo adicionado
+            if not maxima or i - maxima[-1] > window_size//2:
+                maxima.append(i)
     return np.array(maxima)
 
 # --- Asymmetric Least Squares (automático) ---
