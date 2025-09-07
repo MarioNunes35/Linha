@@ -1,8 +1,9 @@
-# streamlit_baseline_smoothing_lineplot_auto_v3.py
-# Conversão automática de ponto/vírgula e milhar, suporte a separadores ; , | \t e ESPAÇO,
-# correção de X com formatos "quebrados", suavização e baseline ALS (com modo Auto).
+# streamlit_baseline_smoothing_lineplot_auto_v4.py
+# Suporte a CSV/TXT/DPT (ASCII), auto separador, auto decimal/milhar, parser especial de X,
+# suavização e baseline ALS (com modo Auto).
 
 import csv
+import io
 import re
 from typing import Dict, Tuple, List, Optional
 
@@ -16,9 +17,9 @@ from scipy import sparse
 from scipy.sparse.linalg import spsolve
 
 
-# =========================
+# -------------------------
 # Utilitários numéricos
-# =========================
+# -------------------------
 PT_BR_PATTERN = r"^-?\d{1,3}(?:\.\d{3})+(?:,\d+)?$|^-?\d+,\d+$"
 EN_US_PATTERN = r"^-?\d{1,3}(?:,\d{3})+(?:\.\d+)?$|^-?\d+\.\d+$"
 
@@ -33,9 +34,8 @@ def _keep_first_dot(s: str) -> str:
 
 def _parse_with(series: pd.Series, decimal: str, thousands: str) -> pd.Series:
     s = series.astype(str).str.replace("\xa0", " ", regex=False).str.strip()
-    # mantém dígitos, sinais, ., ,, e/E, e espaços (removemos depois)
     s = s.str.replace(r"[^0-9\-\+,\.eE ]", "", regex=True)
-    s = s.str.replace(r"\s+", "", regex=True)  # remove espaços (evita "1 234,56")
+    s = s.str.replace(r"\s+", "", regex=True)
     if thousands:
         s = s.str.replace(thousands, "", regex=False)
     s = s.str.replace(decimal, ".", regex=False)
@@ -43,20 +43,19 @@ def _parse_with(series: pd.Series, decimal: str, thousands: str) -> pd.Series:
     return pd.to_numeric(s, errors="coerce")
 
 def auto_numeric(series: pd.Series) -> Tuple[np.ndarray, Dict[str, object]]:
-    """Detecta decimal/milhar automaticamente e retorna (valores, info)."""
     raw = series.astype(str)
     pt_hits = _score_pattern(raw, PT_BR_PATTERN)
     en_hits = _score_pattern(raw, EN_US_PATTERN)
 
     if pt_hits > en_hits:
-        candidates = [(",", "."), (".", ",")]  # preferir pt-BR
+        candidates = [(",", "."), (".", ",")]
     elif en_hits > pt_hits:
-        candidates = [(".", ","), (",", ".")]  # preferir en-US
+        candidates = [(".", ","), (",", ".")]
     else:
-        candidates = [(".", ","), (",", ".")]  # testar ambos
+        candidates = [(".", ","), (",", ".")]
 
     best = None
-    best_score = (-1, -1, -np.inf)  # (n_ok, n_frac_hint, -mediana_magnitude)
+    best_score = (-1, -1, -np.inf)
     for dec, thou in candidates:
         parsed = _parse_with(raw, decimal=dec, thousands=thou)
         n_ok = parsed.notna().sum()
@@ -72,17 +71,14 @@ def auto_numeric(series: pd.Series) -> Tuple[np.ndarray, Dict[str, object]]:
     return parsed.to_numpy(), info
 
 
-# =========================
-# Parser especial p/ X – reconstrói números “quebrados”
-# =========================
+# -------------------------
+# Parser especial para X (reconstrói números quebrados)
+# -------------------------
 def parse_x_smart(series: pd.Series, xmin: float = 300.0, xmax: float = 4500.0) -> np.ndarray:
     """
-    Conserta X com formatos como "399.774.803", "39.934.632", "3.183.630"
-    e também lê corretamente "3994,89" / "3994.89".
-    Estratégia:
-      - Mantém só dígitos e testa decimal após 3 e 4 dígitos (###.resto | ####.resto)
-      - Fallbacks: "primeiro ponto como decimal" e "último ponto como decimal"
-      - Escolhe o candidato mais próximo da faixa [xmin, xmax], preferindo valores >= 1000 quando há empate
+    Corrige X com formatos como '399.774.803', '39.934.632', '3.183.630'
+    e lê corretamente '3994,89'/'3994.89'. Escolhe o candidato mais
+    próximo da faixa [xmin, xmax], preferindo >= 1000 quando possível.
     """
     def conv_first(s: str) -> float:
         s = s.replace(",", ".")
@@ -100,25 +96,18 @@ def parse_x_smart(series: pd.Series, xmin: float = 300.0, xmax: float = 4500.0) 
 
     def best_for_one(x: str) -> float:
         s = str(x)
-        digits = re.sub(r"\D", "", s)  # só dígitos
+        digits = re.sub(r"\D", "", s)
         cands: List[Tuple[str, float]] = []
-
-        # dec após 3 e 4 dígitos
         for k in (3, 4):
             if len(digits) > k:
                 try:
                     cands.append((f"k{k}", float(digits[:k] + "." + digits[k:])))
                 except Exception:
                     pass
-        # fallbacks
-        try:
-            cands.append(("first", conv_first(s)))
-        except Exception:
-            pass
-        try:
-            cands.append(("last", conv_last(s)))
-        except Exception:
-            pass
+        try: cands.append(("first", conv_first(s)))
+        except Exception: pass
+        try: cands.append(("last", conv_last(s)))
+        except Exception: pass
         if not cands:
             return np.nan
 
@@ -127,7 +116,6 @@ def parse_x_smart(series: pd.Series, xmin: float = 300.0, xmax: float = 4500.0) 
                 return 0.0
             return min(abs(v - xmin), abs(v - xmax))
 
-        # escolhe o(s) com menor distância à faixa; dentro da faixa prefere >= 1000
         dists = [(dist(v), tag, v) for tag, v in cands if np.isfinite(v)]
         dmin = min(d for d, _, _ in dists)
         near = [(tag, v) for d, tag, v in dists if abs(d - dmin) < 1e-12]
@@ -140,9 +128,9 @@ def parse_x_smart(series: pd.Series, xmin: float = 300.0, xmax: float = 4500.0) 
     return series.astype(str).apply(best_for_one).to_numpy()
 
 
-# =========================
-# Suavização e baseline
-# =========================
+# -------------------------
+# Baseline & suavização
+# -------------------------
 def moving_average(y: np.ndarray, window: int) -> np.ndarray:
     s = pd.Series(y)
     return s.rolling(window=window, center=True, min_periods=max(1, window // 2)).mean().to_numpy()
@@ -182,7 +170,6 @@ def baseline_als(y: np.ndarray, lam: float = 1e6, p: float = 0.01, niter: int = 
     return z_full
 
 def auto_baseline(y: np.ndarray) -> Tuple[float, float, np.ndarray]:
-    """Busca simples de (λ, p) e retorna o melhor trio (λ, p, z)."""
     lam_list = [1e4, 3e4, 1e5, 3e5, 1e6, 3e6, 1e7]
     p_list = [0.005, 0.01, 0.02, 0.05]
     best, best_score = (1e6, 0.01, None), -1e9
@@ -203,10 +190,53 @@ def auto_baseline(y: np.ndarray) -> Tuple[float, float, np.ndarray]:
     return best
 
 
-# =========================
-# Leitura “inteligente” com correção para header "X;Y"
-# =========================
-def smart_read(uploaded_file, force_str: bool, custom_sep: str,
+# -------------------------
+# Leitura “inteligente” + suporte a .dpt (ASCII)
+# -------------------------
+def _find_data_start(text: str) -> int:
+    # Primeira linha com pelo menos 2 números (qualquer separador)
+    num_rx = re.compile(r"[-+]?\d+(?:[.,]\d+)?(?:[eE][+-]?\d+)?")
+    for i, line in enumerate(text.splitlines()):
+        if len(num_rx.findall(line)) >= 2:
+            return i
+    return 0
+
+def _try_read_dpt_ascii(raw_bytes: bytes, allow_space_delim: bool, force_str: bool) -> Optional[pd.DataFrame]:
+    # Tenta decodificar como texto (ASCII/UTF-8/Latin-1)
+    for enc in (None, "utf-8", "latin1"):
+        try:
+            txt = raw_bytes.decode(enc or "utf-8")
+        except Exception:
+            continue
+        # Remove linhas vazias do início, encontra a primeira linha de dados
+        lines = [ln for ln in txt.splitlines() if ln.strip() != ""]
+        if not lines:
+            continue
+        start = _find_data_start("\n".join(lines))
+        head = "\n".join(lines[start:])
+        # Adivinha separador olhando a primeira linha de dados
+        first = lines[start]
+        sep = None
+        for cand in [";", ",", "\t"] + ([" "] if allow_space_delim else []):
+            if cand in first:
+                sep = (r"\s+" if cand == " " else cand)
+                break
+        # Faz a leitura
+        try:
+            df = pd.read_csv(io.StringIO(head),
+                             sep=sep if sep is not None else None,
+                             engine="python",
+                             header=None,  # sem confiar no header do arquivo
+                             dtype=str if force_str else None)
+            # Se só veio 1 coluna, não é o caso típico ASCII → falha
+            if df.shape[1] <= 1:
+                continue
+            return df
+        except Exception:
+            continue
+    return None  # provavelmente binário
+
+def smart_read(uploaded_file, filename: str, force_str: bool, custom_sep: str,
                allow_space_delim: bool, encodings: List[Optional[str]]):
     def rewind(f):
         try:
@@ -216,10 +246,23 @@ def smart_read(uploaded_file, force_str: bool, custom_sep: str,
 
     dtype_opt = (str if force_str else None)
 
-    # Peek
+    # Peek raw
     rewind(uploaded_file)
     raw = uploaded_file.read()
     rewind(uploaded_file)
+
+    # Se for .dpt, tenta ASCII dedicado primeiro
+    if filename.lower().endswith(".dpt"):
+        df_dpt = _try_read_dpt_ascii(raw, allow_space_delim, force_str)
+        if df_dpt is not None:
+            meta = {"strategy": "dpt_ascii", "encoding": "auto", "header": ""}
+            return df_dpt, meta
+        # Se falhou, é provável que seja binário
+        st.error("Arquivo .dpt parece binário. Exporte como texto/ASCII do software (ex.: OMNIC/OPUS) "
+                 "ou forneça um exemplo para eu adicionar um parser dedicado.")
+        raise RuntimeError("DPT binário não suportado neste leitor.")
+
+    # --- fluxo normal para csv/txt ---
     try:
         sample_text = raw[:65536].decode("utf-8")
     except UnicodeDecodeError:
@@ -241,7 +284,6 @@ def smart_read(uploaded_file, force_str: bool, custom_sep: str,
         except Exception:
             sep_guess = None
 
-    # Tentativas
     attempts = []
     if custom_sep.strip():
         attempts.append(("custom", dict(sep=custom_sep.strip(), engine="python", dtype=dtype_opt)))
@@ -261,7 +303,6 @@ def smart_read(uploaded_file, force_str: bool, custom_sep: str,
             try:
                 df = pd.read_csv(uploaded_file, encoding=enc, **kw)
                 used = (tag, enc or "auto")
-                # Se ainda veio 1 coluna e o header indica separador (ex.: "X;Y"), reler forçando-o
                 if df.shape[1] == 1 and not custom_sep.strip():
                     header = str(df.columns[0])
                     hint = next((d for d in [";", ",", "|", "\t", " "] if d in header), None)
@@ -280,23 +321,18 @@ def smart_read(uploaded_file, force_str: bool, custom_sep: str,
     if df is None:
         raise RuntimeError(f"Falha ao ler arquivo. Último erro: {last_err}")
 
-    meta = {
-        "strategy": used[0],
-        "encoding": used[1],
-        "header": first_line[:200]
-    }
+    meta = {"strategy": used[0], "encoding": used[1], "header": first_line[:200]}
     return df, meta
 
 
-# =========================
+# -------------------------
 # App
-# =========================
-st.set_page_config(page_title="Conversão + Suavização + Baseline (v3)", layout="wide")
-st.title("Conversão automática + Suavização + Linha de Base — v3")
-st.caption("• Lê ; , | \\t e ESPAÇO • Corrige X (ex.: '399.774.803' → 3997.74803; '3994,89' → 3994.89) "
-           "• Converte Y automaticamente • Suaviza e remove baseline (ALS)")
+# -------------------------
+st.set_page_config(page_title="Conversão + Suavização + Baseline (v4)", layout="wide")
+st.title("Conversão automática + Suavização + Linha de Base — v4 (CSV/TXT/DPT)")
+st.caption("Aceita .csv, .txt e **.dpt** (ASCII). Detecta separadores, converte ponto/vírgula por coluna, corrige X, suaviza e remove baseline.")
 
-uploaded = st.file_uploader("Envie um arquivo .csv ou .txt", type=["csv", "txt"])
+uploaded = st.file_uploader("Envie um arquivo .csv / .txt / .dpt", type=["csv", "txt", "dpt"])
 
 with st.expander("Preferências de leitura", expanded=False):
     force_str = st.checkbox("Forçar leitura como texto (dtype=str)", value=True)
@@ -304,8 +340,7 @@ with st.expander("Preferências de leitura", expanded=False):
     allow_space_delim = st.checkbox(
         "Permitir ESPAÇO como separador de colunas",
         value=True,
-        help="Ative apenas se seu arquivo for realmente separado por espaço; "
-             "se seus números usam espaço como milhar, desative."
+        help="Ative só se o arquivo for realmente separado por espaço; se seus números usam espaço como milhar, desative."
     )
 
 # Sidebar – processamento e estilo
@@ -333,6 +368,7 @@ if uploaded:
     try:
         df, read_meta = smart_read(
             uploaded,
+            filename=getattr(uploaded, "name", "").strip(),
             force_str=force_str,
             custom_sep=custom_sep,
             allow_space_delim=allow_space_delim,
@@ -366,7 +402,7 @@ if uploaded:
         # X com parser especial
         X = parse_x_smart(df[col_x], xmin=float(xmin), xmax=float(xmax))
 
-        # Y com detecção automática de decimal/milhar
+        # Y com detecção automática
         data_num = pd.DataFrame({col_x: X})
         metaY: Dict[str, Dict[str, object]] = {}
         for c in y_cols:
@@ -374,11 +410,9 @@ if uploaded:
             data_num[c] = arr
             metaY[c] = info
 
-        # Diagnóstico
         st.markdown("### Detecção de formato (Y)")
         st.markdown("- " + "\n- ".join(
-            f"**{c}** → decimal: '{info['decimal']}', milhar: '{info['thousands']}', "
-            f"não-numéricos: {info['non_numeric']}"
+            f"**{c}** → decimal: '{info['decimal']}', milhar: '{info['thousands']}', não-numéricos: {info['non_numeric']}"
             for c, info in metaY.items()
         ))
 
@@ -416,21 +450,18 @@ if uploaded:
 
             results[c] = dict(original=y_orig, baseline=z, processed=y_sm)
 
-        # Plot (tema escuro p/ combinar com seu print)
+        # Plot
         fig = go.Figure()
         for c in y_cols:
-            if True:  # original
-                fig.add_trace(go.Scatter(
-                    x=Xv, y=results[c]["original"], mode="lines",
-                    name=f"{c} (orig.)",
-                    line=dict(width=max(1, line_width - 1), dash="dot"),
-                    connectgaps=False,
-                ))
+            fig.add_trace(go.Scatter(
+                x=Xv, y=results[c]["original"], mode="lines",
+                name=f"{c} (orig.)", line=dict(width=max(1, line_width - 1), dash="dot"),
+                connectgaps=False,
+            ))
             if baseline_on:
                 fig.add_trace(go.Scatter(
                     x=Xv, y=results[c]["baseline"], mode="lines",
-                    name=f"{c} (baseline)",
-                    line=dict(width=max(1, line_width - 1), dash="dash"),
+                    name=f"{c} (baseline)", line=dict(width=max(1, line_width - 1), dash="dash"),
                     connectgaps=False,
                 ))
             fig.add_trace(go.Scatter(
@@ -467,7 +498,7 @@ if uploaded:
             mime="text/csv",
         )
 
-        # PNG (kaleido)
+        # PNG (se tiver kaleido)
         try:
             import plotly.io as pio
             png = pio.to_image(fig, format="png", width=2000, height=1200, scale=1)
@@ -476,7 +507,8 @@ if uploaded:
             st.info("PNG indisponível aqui. Use o ícone de câmera do Plotly ou instale `kaleido`.")
 
 else:
-    st.info("Envie um CSV/TXT. Se seu arquivo usar espaço como milhar, desative a opção de ESPAÇO como separador.")
+    st.info("Envie um CSV/TXT/DPT. Para .dpt binário, exporte como texto/ASCII no software do equipamento.")
+
 
 
 
