@@ -331,12 +331,15 @@ if baseline_method == "Automático (AsLS)":
 # Cálculo da linha base
 baseline = None
 y_corr = None
+
+# Garantir que as variáveis existam
+interp_method_val = interp_method if 'interp_method' in locals() else 'linear'
 smoothness_val = smoothness if 'smoothness' in locals() else 0.01
 
 if baseline_method == "Manual" and st.session_state.manual_points:
-    baseline = create_manual_baseline(x, y_proc, st.session_state.manual_points, interp_method, smoothness_val)
+    baseline = create_manual_baseline(x, y_proc, st.session_state.manual_points, interp_method_val, smoothness_val)
     if orientation_eff == "Picos para baixo":
-        y_corr = y_proc - baseline  # Corrigido: era baseline - y_proc
+        y_corr = y_proc - baseline
     else:
         y_corr = y_proc - baseline
 
@@ -347,7 +350,7 @@ elif baseline_method == "Automático (AsLS)":
     
     if orientation_eff == "Picos para baixo":
         baseline = -asls_baseline(-y_proc, lam=lam_val, p=p_val, niter=n_val)
-        y_corr = y_proc - baseline  # Corrigido: era baseline - y_proc
+        y_corr = y_proc - baseline
     else:
         baseline = asls_baseline(y_proc, lam=lam_val, p=p_val, niter=n_val)
         y_corr = y_proc - baseline
@@ -356,10 +359,12 @@ elif baseline_method == "Detecção de picos":
     # Normaliza para detecção
     y_norm = (y_proc - np.min(y_proc)) / (np.ptp(y_proc) if np.ptp(y_proc) > 0 else 1)
     
+    sensitivity_val = sensitivity if 'sensitivity' in locals() else 'medium'
+    
     if orientation_eff == "Picos para baixo":
-        peaks, props = adaptive_peak_detection(x, 1-y_norm, sensitivity)
+        peaks, props = adaptive_peak_detection(x, 1-y_norm, sensitivity_val)
     else:
-        peaks, props = adaptive_peak_detection(x, y_norm, sensitivity)
+        peaks, props = adaptive_peak_detection(x, y_norm, sensitivity_val)
     
     # Cria baseline passando pelos vales/topos entre picos
     if len(peaks) > 0:
@@ -379,7 +384,7 @@ elif baseline_method == "Detecção de picos":
         
         baseline = create_manual_baseline(x, y_proc, base_points, 'spline_smooth', 0.01)
         if orientation_eff == "Picos para baixo":
-            y_corr = y_proc - baseline  # Corrigido
+            y_corr = y_proc - baseline
         else:
             y_corr = y_proc - baseline
 
@@ -387,7 +392,7 @@ elif baseline_method == "Híbrido":
     # Combina pontos manuais com detecção automática
     if st.session_state.manual_points:
         # Usa pontos manuais como âncoras
-        baseline = create_manual_baseline(x, y_proc, st.session_state.manual_points, interp_method, smoothness_val)
+        baseline = create_manual_baseline(x, y_proc, st.session_state.manual_points, interp_method_val, smoothness_val)
         
         # Refina com AsLS localizado
         if st.checkbox("Refinar com AsLS", value=False):
@@ -397,7 +402,7 @@ elif baseline_method == "Híbrido":
             baseline = (1-weight) * baseline + weight * baseline_asls
         
         if orientation_eff == "Picos para baixo":
-            y_corr = y_proc - baseline  # Corrigido
+            y_corr = y_proc - baseline
         else:
             y_corr = y_proc - baseline
 
