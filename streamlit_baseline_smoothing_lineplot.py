@@ -1,589 +1,193 @@
 # streamlit_baseline_smoothing_lineplot.py
-# CSV/TXT/DPT (ASCII) -> leitura inteligente, auto decimal/milhar por coluna (Y),
-# parser especial de X, suavização e baseline ALS (com modo Auto).
-# Novidade: detecção/seleção da DIREÇÃO DOS PICOS (Auto / Para cima / Para baixo).
-# Inclui: rótulos sempre str (evita TypeError), baseline ligada por padrão,
-# opção para mostrar/ocultar baseline e resumo do pipeline aplicado.
+# App: linha-base + suavização + detecção de pico (reta branca entre extremidades)
+# Funciona com .txt, .csv e .dpt (2 colunas X,Y; vírgula ou ponto como decimal)
 
-import csv
 import io
 import re
-from typing import Dict, Tuple, List, Optional
-
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
+import plotly.graph_objects as go
+from scipy.signal import savgol_filter, find_peaks, peak_prominences
 
-from scipy.signal import savgol_filter
-from scipy import sparse
-from scipy.sparse.linalg import spsolve
+st.set_page_config(page_title="Baseline & Smoothing (XY)", layout="wide")
 
+# ----------------------------- UTIL ---------------------------------
+NUM_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
 
-# -------------------------
-# Utilitários numéricos
-# -------------------------
-PT_BR_PATTERN = r"^-?\d{1,3}(?:\.\d{3})+(?:,\d+)?$|^-?\d+,\d+$"
-EN_US_PATTERN = r"^-?\d{1,3}(?:,\d{3})+(?:\.\d+)?$|^-?\d+\.\d+$"
+def _infer_orientation(y: np.ndarray) -> str:
+    # comparamos amplitudes relativas ao mediano
+    med = np.median(y)
+    up_amp = float(np.max(y) - med)
+    down_amp = float(med - np.min(y))
+    return "Picos para cima" if up_amp >= down_amp else "Picos para baixo"
 
-def _score_pattern(series: pd.Series, pattern: str) -> int:
-    return series.astype(str).str.fullmatch(pattern).sum()
+def _safe_float(tok: str) -> float:
+    return float(tok.replace(",", "."))
 
-def _keep_first_dot(s: str) -> str:
-    if s.count(".") <= 1:
-        return s
-    i = s.find(".")
-    return s[:i+1] + s[i+1:].replace(".", "")
-
-def _parse_with(series: pd.Series, decimal: str, thousands: str) -> pd.Series:
-    s = series.astype(str).str.replace("\xa0", " ", regex=False).str.strip()
-    s = s.str.replace(r"[^0-9\-\+,\.eE ]", "", regex=True)  # mantém dígitos, sinais, ., ,, e/E, espaço
-    s = s.str.replace(r"\s+", "", regex=True)               # remove espaços (evita "1 234,56")
-    if thousands:
-        s = s.str.replace(thousands, "", regex=False)
-    s = s.str.replace(decimal, ".", regex=False)
-    s = s.apply(_keep_first_dot)
-    return pd.to_numeric(s, errors="coerce")
-
-def auto_numeric(series: pd.Series) -> Tuple[np.ndarray, Dict[str, object]]:
-    """Detecta decimal/milhar automaticamente e retorna (valores, info)."""
-    raw = series.astype(str)
-    pt_hits = _score_pattern(raw, PT_BR_PATTERN)
-    en_hits = _score_pattern(raw, EN_US_PATTERN)
-
-    if pt_hits > en_hits:
-        candidates = [(",", "."), (".", ",")]  # preferir pt-BR
-    elif en_hits > pt_hits:
-        candidates = [(".", ","), (",", ".")]  # preferir en-US
-    else:
-        candidates = [(".", ","), (",", ".")]  # testar ambos
-
-    best = None
-    best_score = (-1, -1, -np.inf)  # (n_ok, n_frac_hint, -mediana_magnitude)
-    for dec, thou in candidates:
-        parsed = _parse_with(raw, decimal=dec, thousands=thou)
-        n_ok = parsed.notna().sum()
-        frac_hint = (raw.str.contains(re.escape(dec)) & ~raw.str.contains(re.escape(thou))).sum()
-        mag = parsed.dropna().abs().median() if n_ok else np.inf
-        score = (n_ok, frac_hint, -float(mag) if np.isfinite(mag) else -np.inf)
-        if score > best_score:
-            best = (parsed, dec, thou)
-            best_score = score
-
-    parsed, decimal_used, thousands_used = best
-    info = {"decimal": decimal_used, "thousands": thousands_used, "non_numeric": int(parsed.isna().sum())}
-    return parsed.to_numpy(), info
-
-
-# -------------------------
-# Parser especial p/ X – reconstrói números “quebrados”
-# -------------------------
-def parse_x_smart(series: pd.Series, xmin: float = 300.0, xmax: float = 4500.0) -> np.ndarray:
-    """
-    Corrige X com formatos como '399.774.803', '39.934.632', '3.183.630'
-    e lê corretamente '3994,89'/'3994.89'. Escolhe o candidato mais
-    próximo da faixa [xmin, xmax], preferindo >= 1000 quando possível.
-    """
-    def conv_first(s: str) -> float:
-        s = s.replace(",", ".")
-        if "." in s:
-            i = s.find(".")
-            return float(s[:i+1] + s[i+1:].replace(".", ""))
-        return float(s)
-
-    def conv_last(s: str) -> float:
-        s = s.replace(",", ".")
-        if "." in s:
-            i = s.rfind(".")
-            return float(s[:i].replace(".", "") + "." + s[i+1:])
-        return float(s)
-
-    def best_for_one(x: str) -> float:
-        s = str(x)
-        digits = re.sub(r"\D", "", s)
-        cands: List[Tuple[str, float]] = []
-        # decimal após 3 e 4 dígitos
-        for k in (3, 4):
-            if len(digits) > k:
-                try:
-                    cands.append((f"k{k}", float(digits[:k] + "." + digits[k:])))
-                except Exception:
-                    pass
-        # fallbacks
-        try: cands.append(("first", conv_first(s)))
-        except Exception: pass
-        try: cands.append(("last", conv_last(s)))
-        except Exception: pass
-        if not cands:
-            return np.nan
-
-        def dist(v: float) -> float:
-            if xmin <= v <= xmax:
-                return 0.0
-            return min(abs(v - xmin), abs(v - xmax))
-
-        dists = [(dist(v), tag, v) for tag, v in cands if np.isfinite(v)]
-        dmin = min(d for d, _, _ in dists)
-        near = [(tag, v) for d, tag, v in dists if abs(d - dmin) < 1e-12]
-        inside = [(tag, v) for tag, v in near if xmin <= v <= xmax]
-        if inside:
-            ge = [(tag, v) for tag, v in inside if v >= 1000]
-            return max(ge or inside, key=lambda kv: kv[1])[1]
-        return max(near, key=lambda kv: kv[1])[1]
-
-    return series.astype(str).apply(best_for_one).to_numpy()
-
-
-# -------------------------
-# Baseline & suavização
-# -------------------------
-def moving_average(y: np.ndarray, window: int) -> np.ndarray:
-    s = pd.Series(y)
-    return s.rolling(window=window, center=True, min_periods=max(1, window // 2)).mean().to_numpy()
-
-def safe_savgol(y: np.ndarray, window: int, poly: int) -> np.ndarray:
-    n = np.count_nonzero(~np.isnan(y))
-    if n < 3:
-        return y.copy()
-    if window % 2 == 0:
-        window += 1
-    window = max(3, min(window, n if n % 2 == 1 else n - 1))
-    poly = max(1, min(poly, window - 1))
-    x = np.arange(len(y))
-    mask = ~np.isnan(y)
-    if mask.sum() < 3:
-        return y.copy()
-    yi = np.interp(x, x[mask], y[mask])
-    ys = savgol_filter(yi, window_length=window, polyorder=poly, mode="interp")
-    ys[~mask] = np.nan
-    return ys
-
-def baseline_als(y: np.ndarray, lam: float = 1e6, p: float = 0.01, niter: int = 20) -> np.ndarray:
-    mask = ~np.isnan(y)
-    yv = y[mask]
-    L = yv.size
-    if L < 3:
-        return np.full_like(y, np.nan)
-    D = sparse.diags([1, -2, 1], [0, 1, 2], shape=(L - 2, L))
-    w = np.ones(L)
-    for _ in range(niter):
-        W = sparse.spdiags(w, 0, L, L)
-        Z = W + lam * D.T @ D
-        z = spsolve(Z, w * yv)
-        w = p * (yv > z) + (1 - p) * (yv <= z)
-    z_full = np.full_like(y, np.nan, dtype=float)
-    z_full[mask] = z
-    return z_full
-
-def auto_baseline(y: np.ndarray) -> Tuple[float, float, np.ndarray]:
-    """Busca simples para (λ, p); projetada para picos positivos. Para picos negativos inverta y antes."""
-    lam_list = [1e4, 3e4, 1e5, 3e5, 1e6, 3e6, 1e7]
-    p_list = [0.005, 0.01, 0.02, 0.05]
-    best, best_score = (1e6, 0.01, None), -1e9
-    for lam in lam_list:
-        for p in p_list:
-            z = baseline_als(y, lam=lam, p=p, niter=15)
-            r = y - z
-            valid = ~np.isnan(r)
-            if valid.sum() < 10:
-                continue
-            prop_above = np.mean(r[valid] >= 0)
-            dz = np.diff(z[~np.isnan(z)])
-            stdy = np.nanstd(y)
-            smooth_penalty = (np.nanstd(dz) / stdy) if stdy else 0.0
-            score = prop_above - 0.1 * smooth_penalty
-            if score > best_score:
-                best, best_score = (lam, p, z), score
-    return best
-
-
-# -------------------------
-# Direção dos picos: Auto / Para cima / Para baixo
-# -------------------------
-def detect_peak_direction(y: np.ndarray) -> Tuple[str, Dict[str, float]]:
-    """Usa quantis robustos. Se a amplitude negativa (med - q05) > positiva (q95 - med), considera 'down'."""
-    y = np.asarray(y, float)
-    y = y[np.isfinite(y)]
-    if y.size < 10:
-        return "up", {"pos_amp": np.nan, "neg_amp": np.nan}
-    med = np.nanmedian(y)
-    q95 = np.nanquantile(y, 0.95)
-    q05 = np.nanquantile(y, 0.05)
-    pos_amp = float(q95 - med)
-    neg_amp = float(med - q05)
-    return ("down" if neg_amp > pos_amp else "up"), {"pos_amp": pos_amp, "neg_amp": neg_amp}
-
-
-# -------------------------
-# Leitura “inteligente” + suporte a .dpt (ASCII)
-# -------------------------
-def _find_data_start(text: str) -> int:
-    # Primeira linha com pelo menos 2 números (qualquer separador)
-    num_rx = re.compile(r"[-+]?\d+(?:[.,]\d+)?(?:[eE][+-]?\d+)?")
-    for i, line in enumerate(text.splitlines()):
-        if len(num_rx.findall(line)) >= 2:
-            return i
-    return 0
-
-def _try_read_dpt_ascii(raw_bytes: bytes, allow_space_delim: bool, force_str: bool) -> Optional[pd.DataFrame]:
-    # Tenta decodificar como texto (ASCII/UTF-8/Latin-1)
-    for enc in (None, "utf-8", "latin1"):
-        try:
-            txt = raw_bytes.decode(enc or "utf-8")
-        except Exception:
+def _parse_xy_text(text: str) -> pd.DataFrame:
+    """Lê qualquer texto com duas colunas numéricas (X,Y). Ignora cabeçalhos."""
+    xs, ys = [], []
+    for line in text.splitlines():
+        if not line.strip():
             continue
-        lines = [ln for ln in txt.splitlines() if ln.strip() != ""]
-        if not lines:
-            continue
-        start = _find_data_start("\n".join(lines))
-        head = "\n".join(lines[start:])
-        # Adivinha separador olhando a primeira linha de dados
-        first = lines[start]
-        sep = None
-        for cand in [";", ",", "\t"] + ([" "] if allow_space_delim else []):
-            if cand in first:
-                sep = (r"\s+" if cand == " " else cand)
-                break
-        try:
-            df = pd.read_csv(
-                io.StringIO(head),
-                sep=sep if sep is not None else None,
-                engine="python",
-                header=None,  # .dpt ASCII geralmente não tem header confiável
-                dtype=str if force_str else None,
-            )
-            if df.shape[1] <= 1:
-                continue
-            # Renomeia para evitar colunas numéricas
-            if df.shape[1] == 2:
-                df.columns = ["X", "Y"]
-            else:
-                df.columns = [f"col{i+1}" for i in range(df.shape[1])]
-            return df
-        except Exception:
-            continue
-    return None  # provavelmente binário
-
-def smart_read(uploaded_file, filename: str, force_str: bool, custom_sep: str,
-               allow_space_delim: bool, encodings: List[Optional[str]]):
-    def rewind(f):
-        try:
-            f.seek(0)
-        except Exception:
-            pass
-
-    dtype_opt = (str if force_str else None)
-
-    # Peek raw
-    rewind(uploaded_file)
-    raw = uploaded_file.read()
-    rewind(uploaded_file)
-
-    # .dpt primeiro (ASCII)
-    if filename.lower().endswith(".dpt"):
-        df_dpt = _try_read_dpt_ascii(raw, allow_space_delim, force_str)
-        if df_dpt is not None:
-            meta = {"strategy": "dpt_ascii", "encoding": "auto", "header": ""}
-            return df_dpt, meta
-        st.error("Arquivo .dpt parece binário. Exporte como texto/ASCII no software do equipamento.")
-        raise RuntimeError("DPT binário não suportado.")
-
-    # fluxo normal csv/txt
-    try:
-        sample_text = raw[:65536].decode("utf-8")
-    except UnicodeDecodeError:
-        sample_text = raw[:65536].decode("latin1", errors="ignore")
-
-    first_line = sample_text.splitlines()[0] if sample_text else ""
-    sep_guess = None
-    for cand in [";", ",", "|", "\t"] + ([" "] if allow_space_delim else []):
-        if cand in first_line:
-            sep_guess = cand
-            break
-    if sep_guess is None:
-        try:
-            dialect = csv.Sniffer().sniff(
-                sample_text,
-                delimiters=";,|\t " if allow_space_delim else ";,|\t"
-            )
-            sep_guess = dialect.delimiter
-        except Exception:
-            sep_guess = None
-
-    attempts = []
-    if custom_sep.strip():
-        attempts.append(("custom", dict(sep=custom_sep.strip(), engine="python", dtype=dtype_opt)))
-    if sep_guess:
-        attempts.append((f"sniffer:{repr(sep_guess)}", dict(sep=sep_guess, engine="python", dtype=dtype_opt)))
-    attempts.append(("sniff_pandas", dict(sep=None, engine="python", dtype=dtype_opt)))
-    for s in [";", ",", "|", "\t"]:
-        attempts.append((f"fixed:{s}", dict(sep=s, engine="python", dtype=dtype_opt)))
-    if allow_space_delim:
-        attempts.append(("space_ws", dict(delim_whitespace=True, engine="python", dtype=dtype_opt)))
-        attempts.append(("space_re", dict(sep=r"\s+", engine="python", dtype=dtype_opt)))
-
-    last_err, used, df = None, None, None
-    for tag, kw in attempts:
-        for enc in encodings:
-            rewind(uploaded_file)
+        nums = NUM_RE.findall(line)
+        if len(nums) >= 2:
             try:
-                df = pd.read_csv(uploaded_file, encoding=enc, **kw)
-                used = (tag, enc or "auto")
-                # Se ainda veio 1 coluna e o header parece "X;Y", reler forçando o separador
-                if df.shape[1] == 1 and not custom_sep.strip():
-                    header = str(df.columns[0])
-                    hint = next((d for d in [";", ",", "|", "\t", " "] if d in header), None)
-                    if hint:
-                        rewind(uploaded_file)
-                        sep_kw = (r"\s+" if hint == " " else hint)
-                        df = pd.read_csv(uploaded_file, sep=sep_kw, engine="python",
-                                         encoding=enc, dtype=dtype_opt)
-                        used = (f"header_hint:{repr(hint)}", enc or "auto")
-                break
-            except Exception as e:
-                last_err, df = e, None
-        if df is not None:
-            break
+                x = _safe_float(nums[0])
+                y = _safe_float(nums[1])
+                xs.append(x); ys.append(y)
+            except Exception:
+                continue
+    if len(xs) < 3:
+        raise ValueError("Não encontrei ao menos 3 pares X,Y no arquivo.")
+    df = pd.DataFrame({"X": np.array(xs, dtype=float), "Y": np.array(ys, dtype=float)})
+    # ordena por X se estiver fora de ordem
+    if not np.all(np.diff(df["X"].values) >= 0):
+        df = df.sort_values("X").reset_index(drop=True)
+    return df
 
-    if df is None:
-        raise RuntimeError(f"Falha ao ler arquivo. Último erro: {last_err}")
+def load_xy(uploaded) -> pd.DataFrame:
+    raw = uploaded.read()
+    try:
+        text = raw.decode("utf-8", errors="ignore")
+    except Exception:
+        text = raw.decode("latin-1", errors="ignore")
+    # tenta CSV rápido
+    try:
+        df = pd.read_csv(io.StringIO(text), sep=None, engine="python",
+                         comment="#", header=None, names=["X","Y"])
+        # se deu certo mas tem coisas estranhas (strings), faz parser robusto
+        if df[["X","Y"]].dtypes.eq(object).any():
+            raise ValueError
+        return df
+    except Exception:
+        return _parse_xy_text(text)
 
-    meta = {"strategy": used[0], "encoding": used[1], "header": first_line[:200]}
-    return df, meta
+def piecewise_linear_lines(x, y, peaks, left_bases, right_bases):
+    """Retorna lista de segmentos [(x0,y0,x1,y1, idxL, idxR), ...] conectando bases."""
+    segs = []
+    for lb, rb in zip(left_bases, right_bases):
+        lb = int(lb); rb = int(rb)
+        if rb <= lb:
+            continue
+        x0, y0 = float(x[lb]), float(y[lb])
+        x1, y1 = float(x[rb]), float(y[rb])
+        segs.append((x0, y0, x1, y1, lb, rb))
+    return segs
 
+def apply_baseline_over_peaks(x, y, segments, orientation="Picos para cima"):
+    """Subtrai a linha-base apenas dentro das janelas de pico (entre as bases)."""
+    yc = y.copy()
+    for (x0, y0, x1, y1, lb, rb) in segments:
+        # reta y_line(x) = y0 + m*(x - x0)
+        m = (y1 - y0) / (x1 - x0) if x1 != x0 else 0.0
+        xr = x[lb:rb+1]
+        y_line = y0 + m * (xr - x0)
+        if orientation == "Picos para cima":
+            yc[lb:rb+1] = y[lb:rb+1] - y_line
+        else:  # picos para baixo
+            yc[lb:rb+1] = y_line - y[lb:rb+1]
+    return yc
 
-# -------------------------
-# App
-# -------------------------
-st.set_page_config(page_title="Conversão + Suavização + Baseline (CSV/TXT/DPT)", layout="wide")
-st.title("Conversão automática + Suavização + Linha de Base — CSV/TXT/DPT")
-st.caption("Aceita .csv, .txt e **.dpt** (ASCII). Detecta separadores, converte ponto/vírgula por coluna, corrige X, suaviza e remove baseline.")
+# ----------------------------- UI -----------------------------------
+st.title("Ajuste de Linha-Base com Reta entre Extremidades do Pico")
 
-uploaded = st.file_uploader("Envie um arquivo .csv / .txt / .dpt", type=["csv", "txt", "dpt"])
+uploaded = st.file_uploader("Carregue um arquivo (.txt, .csv, .dpt) com 2 colunas X,Y", type=["txt","csv","dpt"])
+colA, colB, colC = st.columns([1,1,1])
 
-with st.expander("Preferências de leitura", expanded=False):
-    force_str = st.checkbox("Forçar leitura como texto (dtype=str)", value=True)
-    custom_sep = st.text_input("Separador (opcional; deixe vazio para auto)", value="")
-    allow_space_delim = st.checkbox(
-        "Permitir ESPAÇO como separador de colunas",
-        value=True,
-        help="Ative apenas se o arquivo for realmente separado por espaço; se seus números usam espaço como milhar, desative."
-    )
+with colA:
+    smooth_on = st.checkbox("Suavizar (Savitzky-Golay)", value=True)
+    if smooth_on:
+        w = st.slider("Janela (ímpar)", min_value=5, max_value=201, value=31, step=2)
+        p = st.slider("Ordem do polinômio", 1, 5, 3)
 
-# Sidebar – processamento e estilo
-st.sidebar.header("Processamento")
-xmin, xmax = st.sidebar.slider("Faixa-alvo para X", 100.0, 20000.0, (300.0, 4500.0))
+with colB:
+    orientation = st.selectbox("Orientação dos picos", ["Detectar automaticamente", "Picos para cima", "Picos para baixo"])
+    prom = st.slider("Proeminência mínima", 0.0, 0.2, 0.01, 0.005, help="Aumente para ignorar flutuações pequenas (normalizado pelo range Y)")
+    dist = st.slider("Distância mínima entre picos (pontos)", 1, 1000, 50, 1)
 
-# >>> Direção dos picos <<<
-peak_dir_mode = st.sidebar.selectbox(
-    "Direção dos picos",
-    ["Auto (recomendado)", "Para cima (picos positivos)", "Para baixo (picos negativos)"],
-    index=0,
-    help="Se os picos forem depressões, escolha 'Para baixo' ou deixe em Auto."
-)
-
-smooth_on = st.sidebar.checkbox("Aplicar suavização", value=False)
-smooth_kind = st.sidebar.selectbox("Tipo de suavização", ["Média móvel", "Savitzky-Golay"], index=1)
-mov_window = st.sidebar.slider("Janela (média móvel)", 3, 201, 11, step=2)
-sg_window = st.sidebar.slider("Janela (Savitzky-Golay)", 3, 201, 21, step=2)
-sg_poly = st.sidebar.slider("Ordem do polinômio (Sav-Gol)", 1, 7, 3, step=1)
-
-# baseline ligada por padrão + opção de mostrar curva
-baseline_on = st.sidebar.checkbox("Corrigir linha de base (ALS)", value=True)
-baseline_auto = st.sidebar.checkbox("Auto (λ, p)", value=True, help="Testa alguns (λ, p) e escolhe o melhor.")
-show_baseline = st.sidebar.checkbox("Mostrar curva da baseline", value=True)
-als_lambda_log = st.sidebar.slider("λ (log10)", 3, 8, 6, step=1)
-als_p = st.sidebar.slider("p (assimetria)", 0.001, 0.100, 0.010, step=0.001)
-
-st.sidebar.header("Estilo do gráfico")
-line_width = st.sidebar.slider("Espessura da linha", 1, 8, 3)
-title_size = st.sidebar.slider("Título (px)", 10, 36, 18)
-label_size = st.sidebar.slider("Rótulos dos eixos (px)", 8, 28, 14)
-tick_size = st.sidebar.slider("Ticks (px)", 6, 24, 12)
-legend_size = st.sidebar.slider("Legenda (px)", 8, 24, 12)
+with colC:
+    show_segments = st.checkbox("Mostrar retas brancas", value=True)
+    show_corrected = st.checkbox("Mostrar gráfico corrigido", value=True)
+    export_corrected = st.checkbox("Habilitar exportação do corrigido", value=False)
 
 if uploaded:
-    try:
-        df, read_meta = smart_read(
-            uploaded,
-            filename=getattr(uploaded, "name", "").strip(),
-            force_str=force_str,
-            custom_sep=custom_sep,
-            allow_space_delim=allow_space_delim,
-            encodings=[None, "utf-8", "latin1"],
-        )
-    except Exception as e:
-        st.error(str(e))
-        st.stop()
+    df = load_xy(uploaded)
+    x, y = df["X"].to_numpy(), df["Y"].to_numpy()
 
-    st.subheader("Pré-visualização")
-    st.caption(f"Leitura: {read_meta['strategy']} | encoding: {read_meta['encoding']}")
-    st.dataframe(df.head(20), use_container_width=True)
+    # suavização opcional (não altera o arquivo original)
+    y_proc = y.copy()
+    if smooth_on and len(y_proc) >= w:
+        y_proc = savgol_filter(y_proc, window_length=w, polyorder=p, mode="interp")
 
-    cols = list(df.columns)
-    c1, c2, c3 = st.columns([1, 1, 1], gap="large")
-    with c1:
-        col_x = st.selectbox("Coluna X", options=cols)
-    with c2:
-        y_candidates = [c for c in cols if c != col_x]
-        default_y = y_candidates[:1] if y_candidates else []
-        y_cols = st.multiselect("Colunas Y", options=y_candidates, default=default_y)
-    with c3:
-        order_x = st.checkbox("Ordenar por X crescente", value=True)
+    # normalização para escolhas de proeminência estáveis
+    yr = np.ptp(y_proc) if np.ptp(y_proc) > 0 else 1.0
+    y_norm = (y_proc - np.min(y_proc)) / yr
 
-    st.markdown("---")
+    # orientação
+    if orientation == "Detectar automaticamente":
+        orientation_eff = _infer_orientation(y_proc)
+    else:
+        orientation_eff = orientation
 
-    # Resumo do pipeline selecionado
-    applied = [f"picos={peak_dir_mode.split(' ')[0].lower()}"]
-    if baseline_on:
-        applied.append(f"baseline ({'auto' if baseline_auto else f'λ≈1e{als_lambda_log:g}, p={als_p:.3f}'})")
-    if smooth_on:
-        applied.append(f"suavização ({smooth_kind})")
-    st.caption("Aplicado: " + (" + ".join(applied) if applied else "nenhum"))
+    # detecção de picos (se “picos para baixo”, analisamos no sinal invertido)
+    if orientation_eff == "Picos para cima":
+        peaks, _ = find_peaks(y_norm, distance=dist, prominence=prom)
+        prom_vals, left_bases, right_bases = peak_prominences(y_norm, peaks)
+    else:
+        inv = 1.0 - y_norm  # inverter preservando [0,1]
+        peaks, _ = find_peaks(inv, distance=dist, prominence=prom)
+        prom_vals, left_bases, right_bases = peak_prominences(inv, peaks)
 
-    if st.button("Converter e Processar", type="primary"):
-        if not y_cols:
-            st.warning("Selecione pelo menos uma coluna Y.")
-            st.stop()
+    segments = piecewise_linear_lines(x, y_proc, peaks, left_bases, right_bases)
+    y_corrected = apply_baseline_over_peaks(x, y_proc, segments, orientation=orientation_eff)
 
-        # Labels como string (evita TypeError com colunas numéricas)
-        x_label = str(col_x)
-        y_labels = [str(c) for c in y_cols]
+    # ------------------------- PLOTS -------------------------
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=x, y=y_proc, mode="lines",
+                             name="Sinal (processado)", line=dict(width=3, color="#E4572E")))
+    if show_segments:
+        # desenha as “retas brancas” (entre as bases de cada pico)
+        for (x0,y0,x1,y1,_,_) in segments:
+            fig.add_shape(type="line", x0=x0, y0=y0, x1=x1, y1=y1,
+                          line=dict(color="white", width=6))
+    fig.update_layout(
+        template="plotly_dark",
+        margin=dict(l=30, r=20, t=40, b=40),
+        xaxis_title="X",
+        yaxis_title="Y",
+        height=520,
+    )
 
-        # X com parser especial
-        X = parse_x_smart(df[col_x], xmin=float(xmin), xmax=float(xmax))
+    tabs = st.tabs(["Original (com retas)", "Corrigido" if show_corrected else ""])
+    with tabs[0]:
+        st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
 
-        # Y com detecção automática
-        data_num = pd.DataFrame({x_label: X})
-        metaY: Dict[str, Dict[str, object]] = {}
-        for c in y_cols:
-            arr, info = auto_numeric(df[c])
-            data_num[str(c)] = arr
-            metaY[str(c)] = info
+    if show_corrected:
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=x, y=y_corrected, mode="lines",
+                                  name="Y corrigido", line=dict(width=3)))
+        fig2.update_layout(template="plotly_dark", margin=dict(l=30, r=20, t=40, b=40),
+                           xaxis_title="X", yaxis_title="Y corrigido", height=520)
+        st.plotly_chart(fig2, use_container_width=True, config={"displaylogo": False})
 
-        st.markdown("### Detecção de formato (Y)")
-        st.markdown("- " + "\n- ".join(
-            f"**{c}** → decimal: '{info['decimal']}', milhar: '{info['thousands']}', não-numéricos: {info['non_numeric']}"
-            for c, info in metaY.items()
-        ))
-
-        # Limpeza e ordenação
-        data_num = data_num.dropna(subset=[x_label])
-        if order_x:
-            data_num = data_num.sort_values(by=x_label)
-
-        with st.expander("NaNs por coluna (após conversão)", expanded=False):
-            st.write(data_num.isna().sum())
-
-        # Processamento
-        results: Dict[str, Dict[str, np.ndarray]] = {}
-        Xv = data_num[x_label].to_numpy()
-
-        detections = []  # para mostrar no UI
-
-        for c in y_labels:
-            y_orig = data_num[c].to_numpy()
-
-            # 1) Direção dos picos
-            if peak_dir_mode.startswith("Auto"):
-                direction, stats = detect_peak_direction(y_orig)
-            elif peak_dir_mode.startswith("Para baixo"):
-                direction, stats = "down", {"pos_amp": np.nan, "neg_amp": np.nan}
-            else:
-                direction, stats = "up", {"pos_amp": np.nan, "neg_amp": np.nan}
-            detections.append(f"{c}: {direction} (pos_amp≈{stats['pos_amp']:.3g}, neg_amp≈{stats['neg_amp']:.3g})")
-
-            # 2) Para picos 'down', inverta o sinal para estimar a baseline e depois traga de volta
-            y_for = -y_orig if direction == "down" else y_orig
-
-            if baseline_on:
-                if baseline_auto:
-                    lam, p, z_for = auto_baseline(y_for)
-                else:
-                    lam = 10 ** als_lambda_log
-                    p = als_p
-                    z_for = baseline_als(y_for, lam=lam, p=p, niter=20)
-                z = -z_for if direction == "down" else z_for
-            else:
-                z = np.full_like(y_orig, np.nan)
-
-            # 3) Subtração: para picos 'down', usa z - y (picos positivos)
-            if baseline_on:
-                y_detr = (y_orig - z) if direction == "up" else (z - y_orig)
-            else:
-                y_detr = y_orig.copy()
-
-            # 4) Suavização (opcional)
-            if smooth_on:
-                y_sm = moving_average(y_detr, mov_window) if smooth_kind == "Média móvel" else safe_savgol(y_detr, sg_window, sg_poly)
-            else:
-                y_sm = y_detr
-
-            results[c] = dict(original=y_orig, baseline=z, processed=y_sm)
-
-        # Mostrar detecção
-        with st.expander("Direção dos picos (detecção/seleção)", expanded=False):
-            st.write("\n".join(detections))
-
-        # Plot (tema escuro)
-        fig = go.Figure()
-        for c in y_labels:
-            fig.add_trace(go.Scatter(
-                x=Xv, y=results[c]["original"], mode="lines",
-                name=f"{c} (orig.)", line=dict(width=max(1, line_width - 1), dash="dot"),
-                connectgaps=False,
-            ))
-            if baseline_on and show_baseline:
-                fig.add_trace(go.Scatter(
-                    x=Xv, y=results[c]["baseline"], mode="lines",
-                    name=f"{c} (baseline)", line=dict(width=max(1, line_width - 1), dash="dash"),
-                    connectgaps=False,
-                ))
-            fig.add_trace(go.Scatter(
-                x=Xv, y=results[c]["processed"], mode="lines",
-                name=f"{c} (proc.)", line=dict(width=line_width),
-                connectgaps=False,
-            ))
-
-        fig.update_layout(
-            title="Curvas — original, baseline e processada",
-            xaxis_title=x_label,
-            yaxis_title=", ".join(y_labels) if y_labels else "Y",
-            template="plotly_dark",
-            legend_title_text="Séries",
-            margin=dict(l=50, r=20, t=40, b=50),
-            title_font_size=title_size,
-            legend=dict(font=dict(size=legend_size)),
-            xaxis=dict(title_font=dict(size=label_size), tickfont=dict(size=tick_size)),
-            yaxis=dict(title_font=dict(size=label_size), tickfont=dict(size=tick_size)),
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        # Exporta CSV processado (colunas com nomes string)
-        out = pd.DataFrame({x_label: Xv})
-        for c in y_labels:
-            out[f"{c}_original"] = results[c]["original"]
-            if baseline_on:
-                out[f"{c}_baseline"] = results[c]["baseline"]
-            out[f"{c}_processada"] = results[c]["processed"]
-
+    # ---------------------- EXPORTAÇÃO ----------------------
+    if export_corrected:
+        out = pd.DataFrame({"X": x, "Y_corr": y_corrected})
         st.download_button(
-            "Baixar CSV processado",
+            "Baixar Y corrigido (.csv)",
             data=out.to_csv(index=False).encode("utf-8"),
-            file_name="series_processadas.csv",
+            file_name=f"{uploaded.name.rsplit('.',1)[0]}_corrigido.csv",
             mime="text/csv",
         )
 
-        # PNG (kaleido, se disponível)
-        try:
-            import plotly.io as pio
-            png = pio.to_image(fig, format="png", width=2000, height=1200, scale=1)
-            st.download_button("Baixar PNG (2000×1200)", data=png, file_name="grafico.png", mime="image/png")
-        except Exception:
-            st.info("PNG indisponível aqui. Use o ícone de câmera do Plotly ou instale `kaleido`.")
-
+    # infos úteis
+    st.caption(f"Orientação em uso: **{orientation_eff}** | picos detectados: **{len(segments)}**")
 else:
-    st.info("Envie um CSV/TXT/DPT. Para .dpt binário, exporte como texto/ASCII no software do equipamento.")
+    st.info("Carregue um arquivo para começar. Aceita .txt, .csv e .dpt com duas colunas X,Y.")
+
+
 
 
 
